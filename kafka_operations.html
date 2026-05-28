@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Administration & Operations — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🔧 Kafka Administration &amp; Operations</h1>
+  <div class="header-right"><span class="pill pill-green">Ops</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#producer-slow">Producer Slowness Checklist</a>
+  <a href="#consumer-slow">Consumer Slowness Checklist</a>
+  <a href="#topic-ops">Topic Management</a>
+  <a href="#partition-reassign">Partition Reassignment</a>
+  <a href="#rolling-restart">Rolling Restart Procedure</a>
+  <a href="#leader-balance">Leader Balancing</a>
+  <a href="#quotas">Quotas &amp; Throttling</a>
+  <a href="#offset-mgmt">Offset Management</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Producer Slowness -->
+<div class="section" id="producer-slow">
+  <div class="section-header"><span class="section-icon">🐢</span><span class="section-title">Producer Slowness — Diagnostic Checklist</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">When producers report high latency or throughput drops, work through this checklist systematically. Always start with metrics before changing configs.</p>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>First action:</strong> Check JMX metrics <code>kafka.producer:type=producer-metrics,name=request-latency-avg</code> and <code>record-error-rate</code>. High error rate means retries are killing throughput. High latency without errors means the broker is slow to respond.</div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>#</th><th>Check</th><th>Command / Metric</th><th>What to Look For</th></tr>
+    <tr><td>1</td><td><strong>ISR health — acks=all bottleneck</strong></td><td><code>kafka-topics.sh --describe --under-replicated-partitions</code></td><td class="warn">Any URP = producer blocked waiting for ISR acks. Fix URP first.</td></tr>
+    <tr><td>2</td><td><strong>Broker request queue saturation</strong></td><td>JMX: <code>RequestQueueSize</code>, <code>ProduceRequestQueueTimeMs</code></td><td class="warn">&gt;200 queue size → IO thread bottleneck. Increase <code>num.io.threads</code>.</td></tr>
+    <tr><td>3</td><td><strong>Broker disk I/O</strong></td><td><code>iostat -x 1</code> on broker hosts</td><td class="warn"><code>%util</code> near 100% → disk saturated. Add log dirs or move to NVMe.</td></tr>
+    <tr><td>4</td><td><strong>Broker GC pauses</strong></td><td>Broker GC logs: <code>grep "GC pause" kafka.log</code></td><td class="warn">&gt;200ms GC → broker stalls ack responses. Tune JVM (G1GC, smaller heap).</td></tr>
+    <tr><td>5</td><td><strong>Network throughput producer→broker</strong></td><td><code>sar -n DEV 1</code> or <code>iftop</code></td><td class="warn">NIC saturation → batching helps (larger <code>batch.size</code>, <code>linger.ms</code>).</td></tr>
+    <tr><td>6</td><td><strong>Producer batch efficiency</strong></td><td>JMX: <code>batch-size-avg</code>, <code>batch-size-max</code></td><td>If avg batch ≪ <code>batch.size</code>, batches are being sent before filling — increase <code>linger.ms</code> (5–20ms).</td></tr>
+    <tr><td>7</td><td><strong>Producer buffer full / blocking</strong></td><td>JMX: <code>bufferpool-wait-ratio</code> &gt; 0</td><td class="warn">Producer blocked waiting for buffer space → increase <code>buffer.memory</code> or reduce send rate.</td></tr>
+    <tr><td>8</td><td><strong>Retries and error rate</strong></td><td>JMX: <code>record-retry-rate</code>, <code>record-error-rate</code></td><td class="warn">High retries → transient broker issues or misconfigured <code>delivery.timeout.ms</code>.</td></tr>
+    <tr><td>9</td><td><strong>Compression overhead</strong></td><td>JMX: <code>compression-rate-avg</code>, CPU usage on producer host</td><td>High CPU + low compression ratio → try lz4 instead of gzip/zstd for CPU-constrained producers.</td></tr>
+    <tr><td>10</td><td><strong>Metadata fetch latency</strong></td><td>JMX: <code>metadata-age</code></td><td>If metadata is frequently refreshed, producer may be hitting unknown partitions or leader changes.</td></tr>
+    <tr><td>11</td><td><strong>Schema Registry latency</strong></td><td>Schema Registry logs / HTTP latency</td><td>Avro/Protobuf producers call SR on first schema use — SR down or slow = producer stall.</td></tr>
+    <tr><td>12</td><td><strong>Broker leader imbalance</strong></td><td><code>kafka-topics.sh --describe | grep Leader</code></td><td>If all leaders on one broker, that broker is overloaded. Run preferred replica election.</td></tr>
+    <tr><td>13</td><td><strong>Producer quota throttling</strong></td><td>JMX: <code>produce-throttle-time-avg</code></td><td class="warn">&gt;0ms → broker is throttling this client. Raise quota or reduce send rate.</td></tr>
+    <tr><td>14</td><td><strong>Request timeout vs actual latency</strong></td><td>JMX: <code>request-latency-avg</code> vs <code>request.timeout.ms</code></td><td class="warn">If p99 latency approaches timeout → increase <code>request.timeout.ms</code> or fix root cause.</td></tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Decision tree summary:</strong><br>
+    High latency, no errors → broker disk or IO threads slow → check <code>iostat</code> and <code>RequestHandlerAvgIdlePercent</code><br>
+    High error/retry rate → ISR issues or broker restarts → check <code>UnderReplicatedPartitions</code><br>
+    Producer blocks → buffer full → check <code>bufferpool-wait-ratio</code> → increase <code>buffer.memory</code><br>
+    Throughput low but latency OK → batching inefficient → increase <code>linger.ms</code> and <code>batch.size</code></div>
+  </div>
+</div>
+
+<!-- Consumer Slowness -->
+<div class="section" id="consumer-slow">
+  <div class="section-header"><span class="section-icon">🐌</span><span class="section-title">Consumer Slowness — Diagnostic Checklist</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>First action:</strong> Run <code>kafka-consumer-groups.sh --describe --group &lt;group&gt;</code>. Check LAG column. Is lag growing (consumer falling behind) or stable (caught up but slow processing)? These are fundamentally different problems.</div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>#</th><th>Check</th><th>Command / Metric</th><th>What to Look For</th></tr>
+    <tr><td>1</td><td><strong>Lag trend</strong></td><td><code>kafka-consumer-groups.sh --describe --group &lt;g&gt;</code></td><td class="warn">Growing lag = consumer can't keep up. Stable lag = caught up but not at 0. Both need different fixes.</td></tr>
+    <tr><td>2</td><td><strong>Rebalance frequency</strong></td><td>Consumer logs: "Rebalance in progress", JMX <code>rebalance-rate-per-hour</code></td><td class="warn">Frequent rebalances = consumption pauses. Check heartbeat/poll interval configs.</td></tr>
+    <tr><td>3</td><td><strong>max.poll.interval.ms violation</strong></td><td>Consumer logs: "max.poll.interval.ms exceeded", <code>poll-idle-ratio-avg</code></td><td class="warn">Processing per batch takes longer than <code>max.poll.interval.ms</code> → consumer kicked out → lag spike. Reduce <code>max.poll.records</code>.</td></tr>
+    <tr><td>4</td><td><strong>Processing bottleneck</strong></td><td>Application code profiling, consumer host CPU/memory</td><td>DB writes, HTTP calls, complex transforms inside poll loop → move to async, batch DB inserts.</td></tr>
+    <tr><td>5</td><td><strong>Consumer GC pauses</strong></td><td>Consumer GC logs</td><td class="warn">Long GC pauses trigger session.timeout → rebalance. Use G1GC, tune heap size.</td></tr>
+    <tr><td>6</td><td><strong>Fetch throughput</strong></td><td>JMX: <code>fetch-rate</code>, <code>bytes-consumed-rate</code>, <code>fetch-latency-avg</code></td><td>Low fetch-rate with available data → consumer not polling fast enough. Separate processing from polling thread.</td></tr>
+    <tr><td>7</td><td><strong>Fetch config tuning</strong></td><td><code>fetch.min.bytes</code>, <code>fetch.max.wait.ms</code>, <code>max.partition.fetch.bytes</code></td><td>If fetch-latency-avg ≈ <code>fetch.max.wait.ms</code>, broker is waiting for data. Raise <code>fetch.min.bytes</code> or add partitions/producers.</td></tr>
+    <tr><td>8</td><td><strong>Partition-to-consumer ratio</strong></td><td>Count consumers in group vs topic partition count</td><td>If partitions &lt; consumers → idle consumers. If partitions ≫ consumers → each consumer handles many partitions, increase consumer count or partitions.</td></tr>
+    <tr><td>9</td><td><strong>Broker disk / page cache</strong></td><td><code>iostat</code> on brokers, JMX <code>LocalTimeMs (Fetch)</code></td><td class="warn">High fetch local time → broker serving reads from disk (page cache miss). Old data or broker memory too small.</td></tr>
+    <tr><td>10</td><td><strong>Network between consumer and broker</strong></td><td><code>ping</code>, <code>traceroute</code>, <code>iperf3</code></td><td>High network latency or packet loss → raises fetch-latency-avg. Check cross-AZ or cross-DC traffic.</td></tr>
+    <tr><td>11</td><td><strong>Consumer quota throttling</strong></td><td>JMX: <code>fetch-throttle-time-avg</code></td><td class="warn">&gt;0ms → broker is throttling this consumer group. Raise consumer quota.</td></tr>
+    <tr><td>12</td><td><strong>Schema Registry deserialization</strong></td><td>Consumer logs, SR response time</td><td>Schema ID not cached → SR called per message or per schema refresh. Check SR cache settings.</td></tr>
+    <tr><td>13</td><td><strong>Offset commit latency</strong></td><td>JMX: <code>commit-latency-avg</code></td><td class="warn">Slow offset commits (slow group coordinator) add overhead. Use async commit where safe.</td></tr>
+    <tr><td>14</td><td><strong>Dead Letter Queue backpressure</strong></td><td>DLQ topic lag, error logs</td><td>If consumer writes failed records to DLQ synchronously and DLQ broker is slow → consumer stalls.</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Common anti-pattern:</strong> Setting <code>max.poll.records=500</code> (default) while doing synchronous DB inserts in the poll loop. Each batch of 500 records takes 5+ seconds → exceeds <code>max.poll.interval.ms=300s</code> under load → rebalance storm. Fix: set <code>max.poll.records=50</code> or move DB writes to async batch insert.</div>
+  </div>
+</div>
+
+<!-- Topic Operations -->
+<div class="section" id="topic-ops">
+  <div class="section-header"><span class="section-icon">📋</span><span class="section-title">Topic Management</span></div>
+
+  <div class="diagram">  # Create topic
+  kafka-topics.sh --bootstrap-server broker:9092 \
+    --create --topic payments \
+    --partitions 12 \
+    --replication-factor 3 \
+    --config retention.ms=604800000 \       # 7 days
+    --config min.insync.replicas=2
+
+  # Describe topic (show ISR, leaders, offline partitions)
+  kafka-topics.sh --bootstrap-server broker:9092 --describe --topic payments
+
+  # List only under-replicated partitions
+  kafka-topics.sh --bootstrap-server broker:9092 --describe --under-replicated-partitions
+
+  # List only unavailable partitions (no leader)
+  kafka-topics.sh --bootstrap-server broker:9092 --describe --unavailable-partitions
+
+  # Increase partition count (CANNOT decrease)
+  kafka-topics.sh --bootstrap-server broker:9092 --alter --topic payments --partitions 24
+
+  # Alter topic config
+  kafka-configs.sh --bootstrap-server broker:9092 --entity-type topics \
+    --entity-name payments --alter \
+    --add-config retention.ms=2592000000   # 30 days
+
+  # Delete topic (requires delete.topic.enable=true)
+  kafka-topics.sh --bootstrap-server broker:9092 --delete --topic old-topic</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Partition count is permanent (increasing only).</strong> Increasing partitions breaks key-based ordering for existing keys — consumers that relied on "all records for key X go to same partition" will see re-routing. Plan partition count based on 2-3x expected peak consumers. Industry guideline: don't exceed 4,000 partitions per broker (ZK mode) or much higher with KRaft.</div>
+  </div>
+</div>
+
+<!-- Partition Reassignment -->
+<div class="section" id="partition-reassign">
+  <div class="section-header"><span class="section-icon">🔀</span><span class="section-title">Partition Reassignment</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Used when: adding a broker (rebalance data), removing a broker, fixing skewed storage, or changing replication factor.</p>
+
+  <div class="diagram">  Step 1: Generate reassignment plan
+  kafka-reassign-partitions.sh --bootstrap-server broker:9092 \
+    --topics-to-move-json-file topics.json \
+    --broker-list "1,2,3,4" \      # include new broker IDs
+    --generate > reassignment.json
+
+  Step 2: Review the plan (check source/destination brokers, balance)
+
+  Step 3: Execute with throttle to limit replication bandwidth impact
+  kafka-reassign-partitions.sh --bootstrap-server broker:9092 \
+    --reassignment-json-file reassignment.json \
+    --execute \
+    --throttle 50000000             # 50 MB/s replication throttle
+
+  Step 4: Monitor progress
+  kafka-reassign-partitions.sh --bootstrap-server broker:9092 \
+    --reassignment-json-file reassignment.json \
+    --verify
+
+  Step 5: Remove throttle after completion
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type brokers --entity-default \
+    --alter --delete-config leader.replication.throttled.rate
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type brokers --entity-default \
+    --alter --delete-config follower.replication.throttled.rate</div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Always throttle reassignments in production.</strong> Without a throttle, inter-broker replication can saturate your network and disk, causing consumer lag spikes and broker instability. Start with 50 MB/s and adjust. Forgetting to remove the throttle after completion is a common mistake — it permanently limits replication speed.</div>
+  </div>
+</div>
+
+<!-- Rolling Restart -->
+<div class="section" id="rolling-restart">
+  <div class="section-header"><span class="section-icon">🔄</span><span class="section-title">Rolling Restart Procedure</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Used for: config changes, version upgrades, OS patches. Must be done one broker at a time to avoid simultaneous leader loss.</p>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Pre-checks — cluster health gate</strong><br>Verify zero under-replicated partitions: <code>kafka-topics.sh --describe --under-replicated-partitions</code>. Do NOT proceed with any URP — rolling restart on a degraded cluster risks data loss.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Identify the broker to restart</strong><br>Choose a non-controller broker first. Restarting the controller triggers election overhead. Save controller for last.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Controlled shutdown (preferred)</strong><br>Send <code>SIGTERM</code> — Kafka performs a controlled shutdown: transfers partition leadership to other brokers gracefully. Much faster than a hard kill. Verify with logs: "Controlled shutdown succeeded."</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Wait for ISR recovery</strong><br>After broker restarts, wait until all its partitions rejoin ISR: <code>kafka-topics.sh --describe --under-replicated-partitions</code> should return empty. This can take minutes for large clusters.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Proceed to next broker</strong><br>Only restart the next broker once URP = 0. Repeat for all brokers. Restarting the controller broker last minimizes metadata disruption.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Post-restart: preferred replica election</strong><br>After all brokers restarted, run preferred replica election to restore original partition-leader placement: <code>kafka-leader-election.sh --bootstrap-server broker:9092 --election-type PREFERRED --all-topic-partitions</code></div></div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>Config</th><th>Purpose</th><th>Recommended</th></tr>
+    <tr><td><code>controlled.shutdown.enable</code></td><td>Graceful leadership transfer on stop</td><td class="good">true (default)</td></tr>
+    <tr><td><code>controlled.shutdown.max.retries</code></td><td>Retries for controlled shutdown</td><td>3</td></tr>
+    <tr><td><code>controlled.shutdown.retry.backoff.ms</code></td><td>Backoff between retries</td><td>5000ms</td></tr>
+  </table>
+</div>
+
+<!-- Leader Balancing -->
+<div class="section" id="leader-balance">
+  <div class="section-header"><span class="section-icon">⚖️</span><span class="section-title">Leader Balancing</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">After broker restarts or failures, partition leadership may become skewed. One broker handles more produce/consume requests → becomes hot. Auto-balancing or manual election restores balance.</p>
+
+  <div class="diagram">  # Check leader distribution
+  kafka-topics.sh --bootstrap-server broker:9092 --describe | grep -oP 'Leader:\K\d+' | sort | uniq -c
+
+  # Manual preferred replica election (all partitions)
+  kafka-leader-election.sh --bootstrap-server broker:9092 \
+    --election-type PREFERRED --all-topic-partitions
+
+  # Auto-balancing (broker config)
+  auto.leader.rebalance.enable=true          # default true
+  leader.imbalance.check.interval.seconds=300 # check every 5min
+  leader.imbalance.per.broker.percentage=10   # trigger if >10% imbalanced</div>
+</div>
+
+<!-- Quotas -->
+<div class="section" id="quotas">
+  <div class="section-header"><span class="section-icon">🚦</span><span class="section-title">Quotas &amp; Throttling</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Quotas protect broker stability by limiting per-client bandwidth. Essential in multi-tenant Kafka clusters (like a bank shared by multiple teams).</p>
+
+  <div class="diagram">  # Set producer quota for specific client
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type clients --entity-name my-producer-app \
+    --alter --add-config 'producer_byte_rate=10485760'  # 10 MB/s
+
+  # Set consumer quota
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type clients --entity-name my-consumer-app \
+    --alter --add-config 'consumer_byte_rate=20971520'  # 20 MB/s
+
+  # Set quota per user (with SASL)
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type users --entity-name alice \
+    --alter --add-config 'producer_byte_rate=52428800'  # 50 MB/s
+
+  # Set request quota (% of IO threads time)
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type clients --entity-default \
+    --alter --add-config 'request_percentage=25'        # max 25% of IO thread time
+
+  # View current quotas
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type clients --entity-name my-producer-app --describe</div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>HSBC context:</strong> In a multi-team bank environment, quotas are critical. A rogue batch job or poorly configured producer can saturate shared brokers and affect payment processing pipelines. Set default quotas first (<code>--entity-default</code>), then override per team/application. Monitor <code>produce-throttle-time-avg</code> and <code>fetch-throttle-time-avg</code> per client.</div>
+  </div>
+</div>
+
+<!-- Offset Management -->
+<div class="section" id="offset-mgmt">
+  <div class="section-header"><span class="section-icon">📍</span><span class="section-title">Offset Management</span></div>
+
+  <div class="diagram">  # Check consumer group lag
+  kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --describe --group payments-processor
+
+  Output:
+  GROUP              TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+  payments-processor payments  0          1000            1050            50
+  payments-processor payments  1          800             800             0
+
+  # Reset offsets to earliest (replay all)
+  kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payments-processor --topic payments \
+    --reset-offsets --to-earliest --execute
+
+  # Reset to specific timestamp (e.g., replay from midnight)
+  kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payments-processor --topic payments \
+    --reset-offsets --to-datetime 2026-05-28T00:00:00.000 --execute
+
+  # Reset to specific offset
+  kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --group payments-processor --topic payments \
+    --reset-offsets --to-offset 500 --execute
+
+  # Delete consumer group (must be inactive)
+  kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --delete --group old-consumer-group</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Offset reset requires the consumer group to be inactive.</strong> Stop all consumers in the group first. Resetting to earliest on a compacted topic still starts from the earliest retained offset, not necessarily offset 0.</div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Operations Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A producer is suddenly getting TimeoutExceptions after a routine config push to brokers. What's your investigation path?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        <strong>Structured approach:</strong>
+        <ul>
+          <li><strong>Correlate timing:</strong> Did the config push trigger a rolling restart? If yes, is the cluster fully recovered (zero URP)?</li>
+          <li><strong>Check if brokers are reachable:</strong> <code>kafka-broker-api-versions.sh --bootstrap-server broker:9092</code>. If this fails, it's network/listener configuration, not application.</li>
+          <li><strong>Check listener config:</strong> A common mistake after config push is changing <code>listeners</code> or <code>advertised.listeners</code> incorrectly. Producers get metadata pointing to wrong host/port.</li>
+          <li><strong>Check RequestQueueSize:</strong> If brokers just restarted and are catching up replication, they may be temporarily overwhelmed.</li>
+          <li><strong>Check producer logs:</strong> Is it "Timeout expired while awaiting ack" (ISR issue) or "Failed to update metadata" (connectivity)? Very different root causes.</li>
+          <li><strong>Rollback config change:</strong> If all else fails and you can't identify the cause quickly, roll back the config and re-apply changes one at a time to isolate.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Consumer lag is at 2 million and growing. You have 6 consumers and 12 partitions. What do you do?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        <strong>Step 1 — Identify the bottleneck:</strong> Is this all partitions lagging, or a few specific ones? <code>kafka-consumer-groups.sh --describe</code> per partition.
+        <br><br>
+        <strong>Step 2 — Add consumers:</strong> With 12 partitions and 6 consumers, adding 6 more consumers (to 12:1 ratio) doubles throughput immediately — no code change needed. This is the fastest fix if the bottleneck is consumer count.
+        <br><br>
+        <strong>Step 3 — Check processing bottleneck:</strong> If adding consumers doesn't help, the bottleneck is downstream (DB, API). Profile the processing code. Consider batching writes, async processing, or a faster downstream.
+        <br><br>
+        <strong>Step 4 — Reduce batch size:</strong> Lower <code>max.poll.records</code> to prevent <code>max.poll.interval.ms</code> violations if processing is slow per record.
+        <br><br>
+        <strong>Step 5 — Increase parallelism:</strong> If 12 partitions isn't enough even with 12 consumers, you'll need to increase partition count (for future topics) or increase per-consumer throughput.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How do you safely increase the replication factor of an existing topic with no downtime?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        You use partition reassignment with an updated replica assignment:
+        <ol>
+          <li>Create a JSON file specifying the new replica list for each partition (adding the new broker ID): <code>{"version":1, "partitions":[{"topic":"payments","partition":0,"replicas":[1,2,3]},...]}</code></li>
+          <li>Execute with throttle: <code>kafka-reassign-partitions.sh --execute --throttle 50000000 --reassignment-json-file rf3.json</code></li>
+          <li>Monitor: <code>kafka-reassign-partitions.sh --verify</code> until all partitions report "completed"</li>
+          <li>Remove throttle configs</li>
+        </ol>
+        This is fully online — producers and consumers continue during the reassignment. The new follower fetches data from the leader and joins ISR once caught up. No downtime required.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Connect — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🔌 Kafka Connect</h1>
+  <div class="header-right"><span class="pill pill-purple">Ecosystem</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#what-is">Architecture</a>
+  <a href="#modes">Distributed vs Standalone</a>
+  <a href="#lifecycle">Connector Lifecycle</a>
+  <a href="#offsets">Offset Management</a>
+  <a href="#error">Error Handling &amp; DLQ</a>
+  <a href="#smt">Single Message Transforms</a>
+  <a href="#eos">Exactly-Once in Connect</a>
+  <a href="#connectors">Popular Connectors</a>
+  <a href="#rest">REST API</a>
+  <a href="#qa">Concepts &amp; Scenario Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Architecture -->
+<div class="section" id="what-is">
+  <div class="section-header"><span class="section-icon">🔌</span><span class="section-title">Kafka Connect Architecture</span></div>
+
+  <div class="diagram">  KAFKA CONNECT CLUSTER (Distributed Mode):
+  ─────────────────────────────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                  Connect Worker Cluster                       │
+  │                                                              │
+  │  Worker-1                Worker-2                Worker-3    │
+  │  ┌──────────────┐       ┌──────────────┐       ┌──────────┐ │
+  │  │ Source       │       │ Source       │       │ Sink     │ │
+  │  │ Connector A  │       │ Connector A  │       │Connector │ │
+  │  │ (task 0)     │       │ (task 1)     │       │ B        │ │
+  │  └──────┬───────┘       └──────┬───────┘       └────┬─────┘ │
+  └─────────┼───────────────────────┼────────────────────┼───────┘
+            │                       │                    │
+            ▼ produce               ▼ produce            ▼ consume
+       Kafka Topic              Kafka Topic           Kafka Topic
+       (source data)            (source data)         (sink target)
+
+  Internal Kafka Topics (Connect cluster state):
+    connect-configs       ← connector/task configurations
+    connect-offsets       ← source connector read positions
+    connect-status        ← connector/task status events
+
+  External Systems:
+    Source: Postgres, Oracle, S3, REST API, CDC (Debezium)
+    Sink:   Elasticsearch, S3, HDFS, BigQuery, Snowflake, JDBC</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Worker</h4>
+      <p>A JVM process running the Connect framework. Manages connector lifecycle, assigns tasks, provides REST API. Workers form a cluster via Kafka consumer group protocol — no ZooKeeper needed.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Connector</h4>
+      <p>A logical job configuration. Defines what to connect (DB, S3, etc.), how many tasks, and all connector-specific settings. A connector is just metadata — tasks do the actual work.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Task</h4>
+      <p>The unit of work. A connector splits its work into N tasks (parallelism). Each task runs in a worker thread. Source tasks read from external system → produce to Kafka. Sink tasks consume from Kafka → write to external system.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Converter</h4>
+      <p>Serializes/deserializes data between Connect's internal <code>SourceRecord</code>/<code>SinkRecord</code> format and Kafka bytes. Common: <code>AvroConverter</code> (uses SR), <code>JsonConverter</code>, <code>StringConverter</code>.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Transforms (SMTs)</h4>
+      <p>Lightweight per-record transformations applied in the Connect pipeline — before writing to Kafka (source) or after reading from Kafka (sink). Examples: field masking, routing, timestamp conversion.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Config, Offsets, Status Topics</h4>
+      <p>Connect stores all cluster state in Kafka topics. Config and status have replication factor ≥ 3 for HA. Offsets topic tracks source connector positions — highly written, use high replication and compaction.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Modes -->
+<div class="section" id="modes">
+  <div class="section-header"><span class="section-icon">⚙️</span><span class="section-title">Distributed vs Standalone Mode</span></div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>Standalone Mode</th><th>Distributed Mode</th></tr>
+    <tr><td>Workers</td><td>Single worker process</td><td>Multiple workers, any number</td></tr>
+    <tr><td>Fault tolerance</td><td class="danger">None — single point of failure</td><td class="good">Tasks rebalanced to surviving workers on failure</td></tr>
+    <tr><td>Scaling</td><td>Cannot scale horizontally</td><td>Add workers to scale up</td></tr>
+    <tr><td>State storage</td><td>Local files</td><td>Kafka internal topics (config, offsets, status)</td></tr>
+    <tr><td>REST API</td><td>Single worker endpoint</td><td>Any worker endpoint (they share state via Kafka)</td></tr>
+    <tr><td>Use case</td><td>Dev, testing, single machine scripts</td><td>All production deployments</td></tr>
+  </table>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Never use standalone mode in production.</strong> If the single worker dies, all connectors stop until the worker is manually restarted. In distributed mode, task rebalancing to surviving workers is automatic within seconds.</div>
+  </div>
+</div>
+
+<!-- Connector Lifecycle -->
+<div class="section" id="lifecycle">
+  <div class="section-header"><span class="section-icon">🔄</span><span class="section-title">Connector &amp; Task Lifecycle</span></div>
+
+  <div class="diagram">  CONNECTOR STATES:
+  UNASSIGNED → RUNNING → PAUSED → RUNNING
+                      → FAILED  → RESTARTING → RUNNING
+
+  TASK ASSIGNMENT (Rebalance):
+  1. Connector registered (POST /connectors)
+  2. Leader worker parses config, calls connector.taskConfigs(maxTasks)
+  3. Leader assigns tasks to workers (round-robin by default)
+  4. Workers start tasks → state: RUNNING
+  5. If a worker fails → rebalance → leader reassigns orphaned tasks
+  6. Task failure → task enters FAILED state (connector stays RUNNING)
+     → Admin must restart the task: POST /connectors/{name}/tasks/{id}/restart
+
+  KEY REBALANCE TRIGGER EVENTS:
+  - New connector added
+  - Connector deleted
+  - maxTasks changed
+  - Worker joins or leaves cluster
+  - Worker heartbeat missed (session.timeout.ms)</div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Important:</strong> Task failure does NOT automatically cause the connector to fail or restart (by default). The connector remains in RUNNING state with a FAILED task — you get partial data loss until someone notices. Set up alerting on task failures via the REST API or <code>connect-status</code> topic monitoring.</div>
+  </div>
+</div>
+
+<!-- Offset Management -->
+<div class="section" id="offsets">
+  <div class="section-header"><span class="section-icon">📍</span><span class="section-title">Offset Management</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Source Connector Offsets</h4>
+      <p>Source connectors track their position in the source system (e.g., DB sequence number, file position, API cursor) in the <code>connect-offsets</code> Kafka topic. On restart, the connector resumes from the last committed offset — no data duplication (usually).</p>
+    </div>
+    <div class="concept-card">
+      <h4>Sink Connector Offsets</h4>
+      <p>Sink connectors are Kafka consumers — their offsets are stored in <code>__consumer_offsets</code>. The group ID is derived from the connector name. Sink connectors only commit Kafka offsets after successfully writing to the target system.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Offset Reset</h4>
+      <p>To replay a source connector: delete its entries in <code>connect-offsets</code> (using a producer with null values for the offset keys) and restart the connector. For sink connectors: reset the consumer group offset using <code>kafka-consumer-groups.sh</code>.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Offset Commit Interval</h4>
+      <p>Source tasks commit offsets to <code>connect-offsets</code> on a timer (<code>offset.flush.interval.ms</code>, default 60s). If a task fails before committing, it replays from the last committed position — at-least-once delivery for source connectors.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Error Handling -->
+<div class="section" id="error">
+  <div class="section-header"><span class="section-icon">🚨</span><span class="section-title">Error Handling &amp; Dead Letter Queue</span></div>
+
+  <div class="diagram">  SINK CONNECTOR ERROR HANDLING CONFIG:
+  ─────────────────────────────────────────────────────
+  {
+    "errors.tolerance": "all",          # "none" (fail fast) | "all" (skip+log)
+    "errors.log.enable": "true",        # log error details
+    "errors.log.include.messages": "true", # include message payload in log
+    "errors.deadletterqueue.topic.name": "my-sink-dlq",  # DLQ topic
+    "errors.deadletterqueue.topic.replication.factor": "3",
+    "errors.deadletterqueue.context.headers.enable": "true"  # add error context headers
+  }
+
+  DLQ MESSAGE HEADERS (with context.headers.enable=true):
+    __connect.errors.exception.class.name  → class of the exception
+    __connect.errors.exception.message     → error message
+    __connect.errors.exception.stacktrace  → full stack trace
+    __connect.errors.offset                → Kafka offset of failed record
+    __connect.errors.connector.name        → which connector failed
+    __connect.errors.task.id              → which task failed</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>errors.tolerance=none (default)</h4>
+      <p>First error causes the task to fail and stop. Requires manual intervention to restart. Safe for critical pipelines where data loss or skipping is unacceptable.</p>
+    </div>
+    <div class="concept-card">
+      <h4>errors.tolerance=all</h4>
+      <p>Skip malformed or unwritable records, log them, optionally send to DLQ. Processing continues. Risk: silent data loss if DLQ is not monitored. Set up alerts on DLQ topic lag.</p>
+    </div>
+    <div class="concept-card">
+      <h4>DLQ Topic</h4>
+      <p>A Kafka topic where failed records are written along with error headers. Operations team can inspect, fix, and replay from the DLQ. Must be separate from source topics and monitored for consumer lag.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Retry Behavior</h4>
+      <p>Connect does not have built-in exponential backoff for retries. Some connectors implement their own. For transient failures (DB unavailable), the task typically fails and requires restart — unlike producers which have built-in retry with backoff.</p>
+    </div>
+  </div>
+</div>
+
+<!-- SMTs -->
+<div class="section" id="smt">
+  <div class="section-header"><span class="section-icon">🔧</span><span class="section-title">Single Message Transforms (SMTs)</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">SMTs are stateless per-record transformations applied in the Connect pipeline. Not designed for heavy processing — use Kafka Streams or Flink for complex logic. SMTs are chained and applied in order.</p>
+
+  <table class="kv-table">
+    <tr><th>SMT</th><th>Purpose</th><th>Example Use</th></tr>
+    <tr><td><code>MaskField</code></td><td>Replace sensitive field values with null or literal</td><td>Mask PII before writing to Kafka: mask SSN, credit card</td></tr>
+    <tr><td><code>ReplaceField</code></td><td>Include/exclude/rename fields</td><td>Drop internal DB columns before publishing</td></tr>
+    <tr><td><code>ExtractField</code></td><td>Extract a nested field as the top-level value</td><td>Extract payload from CDC envelope</td></tr>
+    <tr><td><code>InsertField</code></td><td>Add a static or dynamic field</td><td>Add source system name or ingestion timestamp</td></tr>
+    <tr><td><code>TimestampConverter</code></td><td>Convert timestamp formats</td><td>Unix epoch → ISO-8601 string</td></tr>
+    <tr><td><code>RegexRouter</code></td><td>Route records to different topics based on regex</td><td>Route by table name: orders_* → orders-topic</td></tr>
+    <tr><td><code>ValueToKey</code></td><td>Set message key from a field in the value</td><td>Use customer_id field as partition key</td></tr>
+    <tr><td><code>Flatten</code></td><td>Flatten nested structs into top-level fields</td><td>Normalize deeply nested JSON from REST source</td></tr>
+    <tr><td><code>Filter</code></td><td>Drop records matching a condition</td><td>Drop DELETE events from CDC stream</td></tr>
+    <tr><td><code>Cast</code></td><td>Type cast individual fields</td><td>Cast string "123" → integer 123</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>SMT limitations:</strong> SMTs are stateless and process one record at a time. They cannot: join streams, aggregate, look up external data, or do windowed operations. For those, use Kafka Streams, ksqlDB, or Flink downstream of the connector.</div>
+  </div>
+</div>
+
+<!-- EOS -->
+<div class="section" id="eos">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Exactly-Once in Kafka Connect</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Source Connectors</h4>
+      <p>Source connectors are at-least-once by default (offsets committed periodically, not atomically with produce). Exactly-once requires the source system to be replayable AND the connector to use Kafka transactions (available in Connect 3.3+ with <code>exactly.once.source.support=enabled</code>).</p>
+    </div>
+    <div class="concept-card">
+      <h4>Sink Connectors</h4>
+      <p>Exactly-once for sinks requires the target system to be idempotent (e.g., upsert by primary key) or transactional. The sink connector commits Kafka offsets only after successful write. If write fails, re-reads same records — idempotency prevents duplicates.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Kafka 3.3+ EOS Source</h4>
+      <p>Broker-side EOS for source connectors: Connect writes source offsets and Kafka records atomically in a transaction. Even if the worker crashes between write and commit, replay produces the same records — no duplicates.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Practical Advice</h4>
+      <p>For most production cases: use at-least-once + idempotent sinks. True EOS adds complexity and latency. Design your sink to handle duplicates (upsert, dedup key) rather than relying on EOS guarantee.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Popular Connectors -->
+<div class="section" id="connectors">
+  <div class="section-header"><span class="section-icon">🧩</span><span class="section-title">Popular Connectors</span></div>
+
+  <table class="kv-table">
+    <tr><th>Connector</th><th>Type</th><th>Key Features / Interview Points</th></tr>
+    <tr><td>Debezium (PostgreSQL, MySQL, Oracle, MongoDB)</td><td>Source (CDC)</td><td>Captures DB changes via WAL/binlog. Captures inserts, updates, deletes as structured events. Envelope format: before/after/op. Requires DB-level permissions (replication slot for Postgres). Handles schema changes.</td></tr>
+    <tr><td>JDBC Source</td><td>Source</td><td>Polls DB table on schedule. Uses incrementing column (ID) or timestamp column to detect new rows. No delete capture. Simple but not real-time. Good for bulk extraction.</td></tr>
+    <tr><td>JDBC Sink</td><td>Sink</td><td>Writes to any JDBC DB. Supports insert, upsert (by PK). Auto-creates tables from schema. Handle dialect differences (MySQL vs Oracle SQL).</td></tr>
+    <tr><td>S3 Sink</td><td>Sink</td><td>Writes partitioned files to S3. Supports Avro/Parquet/JSON. Partition by time (hourly/daily). Flush on record count or time. Good for data lake patterns.</td></tr>
+    <tr><td>Elasticsearch Sink</td><td>Sink</td><td>Indexes Kafka records into Elasticsearch. Schema-aware with Schema Registry. Handles index routing via SMTs.</td></tr>
+    <tr><td>MirrorMaker 2</td><td>Source+Sink</td><td>Built on Connect framework. Replicates topics between clusters. Handles offset translation, consumer group sync, topic config replication. Use for DR / multi-region.</td></tr>
+    <tr><td>HTTP Sink</td><td>Sink</td><td>POSTs Kafka records to REST endpoints. Configurable auth, retry, batching. Good for webhook patterns.</td></tr>
+    <tr><td>BigQuery/Snowflake Sink</td><td>Sink</td><td>Cloud DW connectors for analytics pipelines. Handle schema auto-evolution, partitioning, batch writes.</td></tr>
+  </table>
+</div>
+
+<!-- REST API -->
+<div class="section" id="rest">
+  <div class="section-header"><span class="section-icon">🌐</span><span class="section-title">Connect REST API</span></div>
+
+  <div class="diagram">  # List all connectors
+  GET /connectors
+
+  # Create connector
+  POST /connectors
+  Body: {"name": "jdbc-source", "config": {"connector.class": "...", ...}}
+
+  # Get connector status (check RUNNING / FAILED)
+  GET /connectors/jdbc-source/status
+
+  # Get task status
+  GET /connectors/jdbc-source/tasks/0/status
+
+  # Restart failed task
+  POST /connectors/jdbc-source/tasks/0/restart
+
+  # Restart connector (and all tasks)
+  POST /connectors/jdbc-source/restart?includeTasks=true
+
+  # Pause connector (no new messages processed)
+  PUT /connectors/jdbc-source/pause
+
+  # Resume connector
+  PUT /connectors/jdbc-source/resume
+
+  # Update connector config (hot reload — no downtime)
+  PUT /connectors/jdbc-source/config
+  Body: {"connector.class": "...", "tasks.max": "4", ...}
+
+  # Delete connector
+  DELETE /connectors/jdbc-source
+
+  # List available connector plugins
+  GET /connector-plugins
+
+  # Validate connector config
+  PUT /connector-plugins/JdbcSourceConnector/config/validate
+  Body: {connector config JSON}</div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Concepts &amp; Scenario Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A Debezium Postgres connector task is FAILED and you see "replication slot does not exist" in logs. What happened and how do you fix it?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Debezium uses a Postgres replication slot to receive WAL changes. Replication slots persist on the DB side and must be dropped manually. Common causes of "slot does not exist":
+        <ul>
+          <li><strong>Someone manually dropped the slot</strong> on the DB — perhaps a DBA cleaning up what they thought was an old slot.</li>
+          <li><strong>The slot was auto-dropped</strong> (unusual, but possible after DB restore from backup).</li>
+        </ul>
+        <strong>Fix:</strong>
+        <ol>
+          <li>Stop the Debezium connector.</li>
+          <li>Delete the connector's offset in <code>connect-offsets</code> topic (send a null-value message for the connector's partition key) — this resets its tracked position.</li>
+          <li>Restart the connector — Debezium will create a new replication slot and take a new snapshot of the table before streaming changes.</li>
+          <li>Expect a full table re-read (snapshot phase) — which may cause duplicate records downstream. Ensure sink is idempotent.</li>
+        </ol>
+        <strong>Prevention:</strong> Never manually drop a Debezium replication slot while the connector is active. Use the Debezium connector DELETE API instead — it cleans up the slot automatically.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How does Kafka Connect handle worker failure? What happens to running tasks?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Connect workers form a consumer group (group ID = <code>connect-cluster</code> by default). When a worker fails:
+        <ul>
+          <li>The group coordinator detects the failure via missed heartbeats (<code>session.timeout.ms</code>).</li>
+          <li>A rebalance is triggered among surviving workers.</li>
+          <li>The failed worker's connectors and tasks are redistributed to surviving workers.</li>
+          <li>Tasks resume from their last committed offset in <code>connect-offsets</code> (source) or <code>__consumer_offsets</code> (sink).</li>
+          <li>There may be duplicate processing for records after the last commit — sink must handle duplicates.</li>
+        </ul>
+        <strong>Time to recover:</strong> Typically 30–90 seconds depending on <code>session.timeout.ms</code> (45s default) + rebalance time. Keep worker count ≥ 3 for HA.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        When should you use Kafka Connect vs writing a custom Kafka producer/consumer?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        <strong>Use Kafka Connect when:</strong>
+        <ul>
+          <li>A proven connector exists for your source/sink system (JDBC, S3, Elasticsearch, Debezium CDC).</li>
+          <li>You need distributed, fault-tolerant ingestion/egress with minimal code.</li>
+          <li>The transformation logic is simple enough for SMTs.</li>
+          <li>You want centralized connector management via REST API.</li>
+        </ul>
+        <strong>Use custom producer/consumer when:</strong>
+        <ul>
+          <li>No connector exists for your system.</li>
+          <li>You need complex business logic, stateful processing, or joins during ingestion.</li>
+          <li>You need fine-grained control over error handling, batching, or protocol specifics.</li>
+          <li>The connector overhead (REST API, distributed state) is unnecessary for a simple point-to-point integration.</li>
+        </ul>
+        <strong>Hybrid approach:</strong> Use Debezium for CDC into Kafka, then Kafka Streams for transformation, then a sink connector to write to target. Best of both worlds.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

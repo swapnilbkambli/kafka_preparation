@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Design & Architecture Scenarios — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🗺️ Design &amp; Architecture Scenarios</h1>
+  <div class="header-right"><span class="pill pill-yellow">Scenarios</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>Design Problems</h3>
+  <a href="#payment-pipeline">High-Throughput Payment Pipeline</a>
+  <a href="#multi-dc">Multi-DC Replication</a>
+  <a href="#eos">Exactly-Once Payments</a>
+  <a href="#schema-evo">Schema Evolution Strategy</a>
+  <a href="#lag-mgmt">Consumer Lag Management</a>
+  <a href="#audit">Audit &amp; Compliance Logging</a>
+  <a href="#tiered">Tiered Storage Design</a>
+</div></nav>
+<div class="content">
+
+<!-- Design 1: Payment Pipeline -->
+<div class="section" id="payment-pipeline">
+  <div class="section-header"><span class="section-icon">💰</span><span class="section-title">Design: High-Throughput Payment Processing Pipeline</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💬</span>
+    <div class="callout-body"><strong>Problem statement:</strong> "Design a Kafka-based payment processing pipeline for HSBC. Requirements: 500K transactions/min peak, &lt;100ms end-to-end latency at p99, no data loss, ordered processing per account, 7-year retention for compliance, real-time fraud detection."</div>
+  </div>
+
+  <div class="diagram">  PROPOSED ARCHITECTURE:
+  ──────────────────────────────────────────────────────────────────
+
+  Payment Source Systems (Core Banking, Cards, FX)
+       │ native Kafka producers (acks=all, idempotent)
+       ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Topic: payments-raw                                          │
+  │ Partitions: 96   RF: 3   min.insync.replicas: 2            │
+  │ Partition key: account_id  (ensures per-account ordering)   │
+  │ Retention: 7 days (hot tier) → S3 tiered storage (7 years) │
+  │ Schema: Avro + Schema Registry (FULL_TRANSITIVE)            │
+  └───────────────────────┬─────────────────────────────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         ▼                ▼                ▼
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐
+  │ Fraud        │  │ Enrichment   │  │ Real-time            │
+  │ Detection    │  │ Service      │  │ Notifications        │
+  │ (Flink CEP)  │  │(KStreams app) │  │(consumer → push)     │
+  │              │  │+ account table│ │                      │
+  └──────┬───────┘  └──────┬───────┘  └──────────────────────┘
+         │                 │
+         ▼                 ▼
+  fraud-alerts      payments-enriched (96 partitions)
+  topic              │
+                     ▼
+              Core Banking Sink
+              (JDBC Connector → Oracle)
+              + Reporting Sink (S3 Parquet)</div>
+
+  <p style="color:var(--muted);font-size:14px;font-weight:600;margin:20px 0 10px;">Key Design Decisions &amp; Rationale:</p>
+
+  <table class="kv-table">
+    <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+    <tr><td>Partition count</td><td>96 (divisible by 2,3,4,6,8,12,16,24,32,48)</td><td>Allows flexible consumer scaling to any of these counts without rebalance inefficiency. 96 partitions at 500K/min = ~5K msg/sec/partition — comfortable headroom.</td></tr>
+    <tr><td>Partition key</td><td>account_id (SHA256 mod partitions)</td><td>Guarantees per-account ordering — all transactions for account X always land on the same partition, in order. Critical for balance calculations.</td></tr>
+    <tr><td>Producer config</td><td>acks=all, idempotence=true, RF=3, min.insync=2</td><td>No data loss. Idempotence handles retries without duplicates. 3 replicas tolerate 1 broker failure.</td></tr>
+    <tr><td>Retention</td><td>7 days hot + tiered storage to S3 (7 years)</td><td>7-year compliance requirement. Tiered storage keeps local disks manageable. Cold data in S3 at fraction of the cost.</td></tr>
+    <tr><td>Schema</td><td>Avro + Schema Registry (FULL_TRANSITIVE)</td><td>FULL_TRANSITIVE ensures any schema version can be read by any other — critical for 7-year data where consumers may be many versions behind.</td></tr>
+    <tr><td>Fraud detection</td><td>Flink CEP (not ksqlDB)</td><td>Complex event patterns (velocity checks, graph analytics, ML scoring) exceed ksqlDB capabilities. Flink handles stateful multi-event patterns efficiently.</td></tr>
+    <tr><td>Consumer groups</td><td>Separate group per consumer application</td><td>Each downstream (fraud, enrichment, notifications, sink) advances its own offset independently — failure of one doesn't affect others.</td></tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Interviewer follow-up: "How do you handle hot partitions?"</strong> If a single account (e.g., batch payment reconciliation account) sends thousands of transactions per second, it fills one partition. Mitigation: add a suffix to the partition key (account_id + timestamp_bucket) to spread load. Trade-off: you lose strict single-partition ordering but can use application-level sequence numbers for reordering.</div>
+  </div>
+</div>
+
+<!-- Design 2: Multi-DC Replication -->
+<div class="section" id="multi-dc">
+  <div class="section-header"><span class="section-icon">🌍</span><span class="section-title">Design: Multi-Datacenter Replication Strategy</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💬</span>
+    <div class="callout-body"><strong>Problem statement:</strong> "HSBC needs Kafka in both London (primary) and Singapore (DR). Design the replication strategy for RPO &lt; 1min and RTO &lt; 15min."</div>
+  </div>
+
+  <div class="diagram">  MIRRORMAKER 2 ACTIVE-PASSIVE TOPOLOGY:
+  ──────────────────────────────────────────────────────────────────
+
+  London (PRIMARY)                  Singapore (DR)
+  ─────────────────                 ───────────────────
+  Cluster: kafka-lon                Cluster: kafka-sin
+  Topics:                           Topics (replicas):
+    payments-raw        ──MM2──►      lon.payments-raw
+    payments-enriched   ──MM2──►      lon.payments-enriched
+    fraud-alerts        ──MM2──►      lon.fraud-alerts
+
+  MirrorMaker 2 (Connect-based):
+    - Runs as Connect cluster near Singapore
+    - Consumes from London, produces to Singapore
+    - Replicates topic configs, ACLs, consumer group offsets
+    - Prefix "lon." distinguishes replicated topics
+
+  Consumer Group Offset Sync:
+    MirrorMaker 2 also replicates __consumer_offsets
+    → On failover, Singapore consumers resume from last
+      London offset (translated to Singapore offset)
+    → Typical lag: seconds behind London
+
+  FAILOVER PROCEDURE (RTO < 15min):
+  1. Detect London failure (health checks, automated)
+  2. Stop MM2 replication (prevent split-brain)
+  3. Redirect DNS: kafka-primary.hsbc.com → Singapore cluster
+  4. Consumers restart, use offset mapping from MM2 sync
+  5. Producers start writing to Singapore
+  6. RTO: ~5-10 min for detection + failover + restart
+
+  ACTIVE-ACTIVE (for read locality, not failover):
+  ──────────────────────────────────────────────────────────────────
+  London:   payments-raw → lon.* → (MM2 to Singapore)
+  Singapore: payments-raw → sin.* → (MM2 to London)
+  Global aggregation topic: both clusters subscribe to both prefixes
+  Note: active-active adds complexity (deduplication, ordering).
+  Only use if latency to single primary is unacceptable for Singapore producers.</div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>Active-Passive</th><th>Active-Active</th></tr>
+    <tr><td>Complexity</td><td>Low</td><td>High (dedup, conflict resolution)</td></tr>
+    <tr><td>RPO</td><td>Seconds (MM2 lag)</td><td>Near-zero (local write)</td></tr>
+    <tr><td>RTO</td><td>5–15 minutes</td><td>Near-zero (already active)</td></tr>
+    <tr><td>Write latency</td><td>Low (writes to nearest primary)</td><td>Low (writes locally)</td></tr>
+    <tr><td>Use case</td><td>DR, compliance isolation</td><td>Global low-latency with local writes</td></tr>
+    <tr><td>Offset management</td><td>MM2 syncs offsets for failover</td><td>Complex — two separate offset spaces</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Offset translation:</strong> Kafka offsets are cluster-specific. Offset 1000 in London ≠ Offset 1000 in Singapore (different records may be at those offsets). MM2 maintains an offset sync topic (<code>mm2-offset-syncs.&lt;cluster&gt;.internal</code>) that maps source offsets to target offsets. On failover, use MM2's <code>RemoteClusterUtils.translateOffsets()</code> to find the correct Singapore offset for each consumer group's position.</div>
+  </div>
+</div>
+
+<!-- Design 3: Exactly-Once -->
+<div class="section" id="eos">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Design: Exactly-Once Payment Processing</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💬</span>
+    <div class="callout-body"><strong>Problem statement:</strong> "Design a debit/credit system where a payment event must update both the debit account balance and credit account balance exactly once — no double charges, no missed payments, even in the face of crashes."</div>
+  </div>
+
+  <div class="diagram">  EXACTLY-ONCE WITH KAFKA TRANSACTIONS:
+  ──────────────────────────────────────────────────────────────────
+
+  Input: payments-raw topic (validated payment events)
+
+  Kafka Streams Processor (EOS enabled):
+    config:
+      processing.guarantee = exactly_once_v2  (Kafka 2.5+)
+      → enables:
+        - Transactional producer (transactional.id per task)
+        - Consumer with isolation.level=read_committed
+        - Atomic: consume(payments-raw) + produce(balance-updates)
+
+  Processing logic (atomic transaction per batch):
+  ┌──────────────────────────────────────────────────────────┐
+  │ BEGIN TRANSACTION (transactional.id = "balance-task-P3") │
+  │   Read: payment record from payments-raw partition 3      │
+  │   Compute: debit acc-001 by $100, credit acc-002 by $100 │
+  │   Write: balance-updates (debit event + credit event)    │
+  │   Commit offsets for payments-raw (in same transaction)  │
+  │ COMMIT TRANSACTION                                        │
+  └──────────────────────────────────────────────────────────┘
+
+  If crash after write but before commit:
+  → Transaction is ABORTED (incomplete)
+  → Consumer with read_committed isolation sees nothing
+  → Next startup: resume from last committed offset
+  → Replay the same payment → same transaction ID
+  → Broker deduplicates (same transactional.id + sequence) → idempotent
+  → EXACTLY ONE write of balance update, guaranteed
+
+  Downstream Sink (JDBC to Oracle):
+  → Must use upsert (ON CONFLICT UPDATE) with deduplication key
+  → EOS at Kafka level does not extend to the DB
+  → DB idempotency is required for end-to-end EOS</div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Key insight:</strong> Kafka's EOS guarantee covers the read-process-write cycle WITHIN Kafka (consume from topic A, produce to topic B, commit offset — all atomically). It does NOT extend to external systems (databases, APIs). For a complete end-to-end exactly-once system: Kafka EOS for the Kafka pipeline + idempotent sink for external writes + application-level deduplication key.</div>
+  </div>
+</div>
+
+<!-- Design 4: Schema Evolution -->
+<div class="section" id="schema-evo">
+  <div class="section-header"><span class="section-icon">🌱</span><span class="section-title">Design: Zero-Downtime Schema Evolution Strategy</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💬</span>
+    <div class="callout-body"><strong>Problem statement:</strong> "The Payment schema needs a new 'fx_rate' field for international payments. The topic has 6 months of historical data. You have 20 consumer services across 5 teams. How do you evolve without downtime?"</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Verify compatibility mode</strong><br>Check current mode: <code>GET /config/payments-value</code>. Should be BACKWARD or FULL. If NONE — establish governance first before any schema changes.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Design the schema change (BACKWARD compatible)</strong><br>Add <code>fx_rate</code> as optional with default null: <code>{"name":"fx_rate","type":["null","double"],"default":null}</code>. Test compatibility: <code>POST /compatibility/subjects/payments-value/versions/latest</code>. If <code>is_compatible: true</code> → safe to proceed.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Register new schema version</strong><br><code>POST /subjects/payments-value/versions</code>. Get new schema_id (e.g., 43). Existing consumers using schema v1 can still read messages — the null default handles missing field.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Deploy consumers first (BACKWARD strategy)</strong><br>Update all 20 consumer services to handle schema v2 (can read fx_rate if present, handle null if absent). This is safe — they still read old v1 messages (fx_rate=null by default). No coordination needed — roll out consumer updates team by team.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Deploy producers last</strong><br>Once all consumers are on v2-capable code: update producers to send v2 messages with fx_rate populated (or null for domestic payments). Producers now use schema_id=43.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Historical data handling</strong><br>Old messages with schema_id=42 remain in the topic for 6 months (retention period). Consumers read them fine — Avro reader schema v2 reads writer schema v1 messages and sets fx_rate=null (default). Zero data migration needed.</div></div>
+  </div>
+</div>
+
+<!-- Design 5: Consumer Lag Management -->
+<div class="section" id="lag-mgmt">
+  <div class="section-header"><span class="section-icon">📊</span><span class="section-title">Design: Autoscaling Consumer Groups Based on Lag</span></div>
+
+  <div class="diagram">  KEDA (Kubernetes Event-Driven Autoscaler) + Kafka:
+  ──────────────────────────────────────────────────────────────────
+
+  Kafka Consumer Group                     K8s Deployment
+  payments-processor                       payment-app
+       │                                        │
+       │ lag metric                             │ replicas
+       ▼                                        ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  KEDA ScaledObject:                                          │
+  │    scaleTargetRef: payment-app                               │
+  │    minReplicaCount: 2                                        │
+  │    maxReplicaCount: 12   ← must equal partition count        │
+  │    triggers:                                                  │
+  │      - type: kafka                                           │
+  │        metadata:                                             │
+  │          bootstrapServers: broker:9092                       │
+  │          consumerGroup: payments-processor                   │
+  │          topic: payments                                     │
+  │          lagThreshold: "50000"  ← scale up at 50K lag        │
+  │          offsetResetPolicy: latest                           │
+  └─────────────────────────────────────────────────────────────┘
+
+  Scaling logic:
+  desired_replicas = ceil(current_lag / lagThreshold)
+  capped by maxReplicaCount (= partition count)
+
+  Example:
+  lag=200K → ceil(200K/50K) = 4 replicas
+  lag=500K → ceil(500K/50K) = 10 replicas
+  lag=1M   → ceil(1M/50K)  = 12 replicas (capped at max)</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Scale down carefully:</strong> Scaling down triggers rebalances — each rebalance causes a brief consumption pause. Set <code>stabilizationWindowSeconds: 300</code> on scale-down to prevent oscillating between 4 and 6 replicas when lag hovers near the threshold. Scale up aggressively, scale down conservatively.</div>
+  </div>
+</div>
+
+<!-- Design 6: Audit Logging -->
+<div class="section" id="audit">
+  <div class="section-header"><span class="section-icon">📝</span><span class="section-title">Design: Compliance Audit Trail for Financial Records</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💬</span>
+    <div class="callout-body"><strong>Requirement:</strong> Every Kafka topic write and read for financial topics must be auditable. 7-year retention. Tamper-proof. Regulators can query: "who consumed payment X and when?"</div>
+  </div>
+
+  <div class="diagram">  AUDIT ARCHITECTURE:
+  ──────────────────────────────────────────────────────────────────
+
+  Option A: Kafka-native audit log (KIP-813, Confluent Platform)
+    - Broker-level audit events → audit-log Kafka topic
+    - Captures: PRODUCE/CONSUME/DESCRIBE/ALTER/DELETE per topic
+    - Headers: principal, client-id, timestamp, topic, partition, offset
+    - Route audit topic to S3/SIEM via Sink connector
+
+  Option B: Application-level audit (custom)
+    - Each producer/consumer writes audit record to audit-trail topic
+    - Audit record schema: {eventType, principal, topic, partition,
+        offset, timestamp, clientId, correlationId}
+    - audit-trail topic: RF=3, compacted+delete policy,
+        7yr retention via tiered storage, ACL: write-only for producers,
+        read-only for compliance team
+
+  Option C: Schema Registry + headers (lightweight)
+    - Producers add headers: X-Source-System, X-Correlation-ID
+    - These headers are stored with each Kafka message (no extra topic)
+    - Consumer group offsets tracked in __consumer_offsets (always)
+    - Use Confluent's Audit Log or SIEM integration for access tracking
+
+  TAMPER PROTECTION:
+    - audit-trail topic: ACL no DELETE permission for any client
+    - Tiered storage with WORM (Write-Once-Read-Many) S3 bucket policy
+    - Kafka message CRC (built-in) + hash chain for integrity verification
+    - Regular export to immutable cold storage (AWS Glacier, Azure Archive)</div>
+</div>
+
+<!-- Design 7: Tiered Storage -->
+<div class="section" id="tiered">
+  <div class="section-header"><span class="section-icon">🗄️</span><span class="section-title">Design: Tiered Storage for Long-Retention Topics</span></div>
+
+  <div class="diagram">  TIERED STORAGE ARCHITECTURE (Kafka 3.6+):
+  ──────────────────────────────────────────────────────────────────
+
+  Kafka Broker (local storage)
+  ┌─────────────────────────────────────────────────────────────┐
+  │ payments-raw partition 0:                                    │
+  │   Active segment: 00001234567.log  (writes here)            │
+  │   Recent sealed segments: last 1 day (local.retention.ms)  │
+  └──────────────────────┬──────────────────────────────────────┘
+                         │ remote log manager uploads old segments
+                         ▼
+  Remote Storage (S3 / GCS / Azure Blob)
+  ┌─────────────────────────────────────────────────────────────┐
+  │ s3://hsbc-kafka-tiered/payments-raw/partition-0/            │
+  │   00000000000000000000.log  (oldest, day 1)                 │
+  │   00000000000012345678.log  (day 30)                        │
+  │   ... 7 years of segments ...                               │
+  │   Remote index: offset → S3 object key mapping              │
+  └─────────────────────────────────────────────────────────────┘
+
+  Consumer seeking to old offset:
+  → Broker checks: local? No (beyond local.retention.ms)
+  → Fetches from S3 via RemoteLogManager
+  → Transparent to consumer — same Fetch API, slight extra latency
+
+  Key configs:
+  remote.log.storage.system.enable=true
+  remote.log.manager.class=org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
+  log.local.retention.ms=86400000        ← 1 day local
+  log.retention.ms=220752000000          ← 7 years total (local + remote)
+  remote.log.metadata.manager.class=...  ← S3 metadata manager</div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Cost impact:</strong> Tiered storage dramatically reduces broker disk requirements. A topic that previously needed 21 TB of local SSD (7 years at 3 TB/year) now needs only 3 TB local (1 day hot tier) + cheap S3 storage for the rest. S3 is ~50x cheaper than NVMe SSD per GB. For compliance-heavy industries (banking, healthcare), tiered storage is near-mandatory for long-retention topics.</div>
+  </div>
+</div>
+
+</div></div>
+</body></html>

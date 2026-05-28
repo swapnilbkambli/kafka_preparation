@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Observability & Monitoring — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>📊 Observability &amp; Monitoring</h1>
+  <div class="header-right"><span class="pill pill-purple">Observability</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#metrics-overview">Metrics Overview</a>
+  <a href="#broker-metrics">Broker Metrics</a>
+  <a href="#producer-metrics">Producer Metrics</a>
+  <a href="#consumer-metrics">Consumer Metrics</a>
+  <a href="#prometheus">Prometheus Setup</a>
+  <a href="#alerts">Alerting Rules</a>
+  <a href="#lag-monitoring">Consumer Lag Monitoring</a>
+  <a href="#dashboard">Dashboard Essentials</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Metrics Overview -->
+<div class="section" id="metrics-overview">
+  <div class="section-header"><span class="section-icon">📊</span><span class="section-title">Kafka Metrics Stack</span></div>
+
+  <div class="diagram">  KAFKA OBSERVABILITY STACK:
+  ──────────────────────────────────────────────────────────────────
+
+  Kafka Brokers / Clients
+       │ JMX (Java Management Extensions)
+       ▼
+  JMX Exporter (Java agent, port 7071)
+       │ Prometheus scrape (HTTP /metrics)
+       ▼
+  Prometheus (time-series DB, 15s scrape interval)
+       │ PromQL queries
+       ▼
+  Grafana (dashboards)
+       │
+       ├── Consumer Lag Dashboard
+       ├── Broker Health Dashboard
+       ├── Producer Throughput Dashboard
+       └── Topic Metrics Dashboard
+
+  CONSUMER LAG (specialized):
+  Burrow (LinkedIn) → watches __consumer_offsets → lag per group/partition
+  OR
+  kafka-consumer-groups.sh --describe (CLI, ad-hoc)
+  OR
+  kminion / Redpanda Console (modern replacements)
+
+  LOG SHIPPING:
+  Broker logs → Filebeat/Fluentd → Elasticsearch/Splunk
+  GC logs → same pipeline → alert on long GC pauses</div>
+</div>
+
+<!-- Broker Metrics -->
+<div class="section" id="broker-metrics">
+  <div class="section-header"><span class="section-icon">⚙️</span><span class="section-title">Critical Broker Metrics</span></div>
+
+  <table class="kv-table">
+    <tr><th>Metric (JMX MBean)</th><th>What it Measures</th><th>Alert Threshold</th></tr>
+    <tr><td><code>kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions</code></td><td>Partitions with ISR &lt; replication factor</td><td class="danger">ANY &gt; 0 for &gt; 30s → page oncall</td></tr>
+    <tr><td><code>kafka.server:type=ReplicaManager,name=OfflinePartitionsCount</code></td><td>Partitions with no leader (unavailable)</td><td class="danger">ANY &gt; 0 → critical, data unavailable</td></tr>
+    <tr><td><code>kafka.controller:type=KafkaController,name=ActiveControllerCount</code></td><td>Number of active controllers (must be exactly 1)</td><td class="danger">≠1 → critical</td></tr>
+    <tr><td><code>kafka.network:type=RequestChannel,name=RequestQueueSize</code></td><td>Requests waiting for IO threads</td><td class="warn">&gt;100 warn, &gt;400 critical</td></tr>
+    <tr><td><code>kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent</code></td><td>Free capacity of network threads</td><td class="warn">&lt;30% → add network threads</td></tr>
+    <tr><td><code>kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent</code></td><td>Free capacity of IO threads</td><td class="warn">&lt;30% → IO thread saturation</td></tr>
+    <tr><td><code>kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec</code></td><td>Incoming data rate (bytes/sec)</td><td>Baseline + 3σ → traffic spike alert</td></tr>
+    <tr><td><code>kafka.server:type=BrokerTopicMetrics,name=BytesOutPerSec</code></td><td>Outgoing data rate (bytes/sec)</td><td>Baseline + 3σ → consumption spike</td></tr>
+    <tr><td><code>kafka.server:type=BrokerTopicMetrics,name=MessagesInPerSec</code></td><td>Message ingestion rate</td><td>Monitor for anomalies</td></tr>
+    <tr><td><code>kafka.log:type=LogFlushStats,name=LogFlushRateAndTimeMs</code></td><td>Log flush frequency and duration</td><td class="warn">&gt;1000ms → disk slow</td></tr>
+    <tr><td><code>kafka.server:type=ReplicaFetcherManager,name=MaxLag</code></td><td>Max replica fetch lag (follower behind leader)</td><td class="warn">&gt;5000 (messages) → follower lagging</td></tr>
+    <tr><td><code>java.lang:type=Memory,name=HeapMemoryUsage</code></td><td>JVM heap usage</td><td class="warn">&gt;80% heap → GC pressure risk</td></tr>
+  </table>
+
+  <div class="diagram">  PRODUCE REQUEST LATENCY BREAKDOWN (JMX):
+  ──────────────────────────────────────────────────────────────────
+  kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce
+    = QueueTimeMs       (waiting in RequestQueue for IO thread)
+    + LocalTimeMs       (IO thread processing + disk write)
+    + RemoteTimeMs      (waiting for ISR acks in purgatory)
+    + ResponseSendTimeMs (sending response back via NetworkThread)
+
+  Diagnosis:
+  High QueueTimeMs  → IO thread bottleneck  → increase num.io.threads
+  High LocalTimeMs  → disk bottleneck        → check iostat, add disks
+  High RemoteTimeMs → ISR/follower issue     → check URP, follower lag
+  High ResponseSendTimeMs → network thread bottleneck → increase num.network.threads</div>
+</div>
+
+<!-- Producer Metrics -->
+<div class="section" id="producer-metrics">
+  <div class="section-header"><span class="section-icon">📤</span><span class="section-title">Producer Client Metrics</span></div>
+
+  <table class="kv-table">
+    <tr><th>Metric</th><th>Normal Range</th><th>Alert When</th></tr>
+    <tr><td><code>record-error-rate</code></td><td>0</td><td class="danger">ANY &gt; 0 for &gt;60s</td></tr>
+    <tr><td><code>record-retry-rate</code></td><td>Near 0</td><td class="warn">&gt;5/sec sustained</td></tr>
+    <tr><td><code>request-latency-avg</code></td><td>&lt;20ms</td><td class="warn">&gt;100ms</td></tr>
+    <tr><td><code>request-latency-max</code></td><td>&lt;100ms</td><td class="warn">&gt;1000ms</td></tr>
+    <tr><td><code>bufferpool-wait-ratio</code></td><td>0</td><td class="warn">&gt;0.1 (10% time blocked)</td></tr>
+    <tr><td><code>batch-size-avg</code></td><td>Near batch.size</td><td>If ≪ batch.size → increase linger.ms</td></tr>
+    <tr><td><code>compression-rate-avg</code></td><td>0.1–0.5 (10–50%)</td><td>Near 1.0 → compression not helping (random data)</td></tr>
+    <tr><td><code>record-send-rate</code></td><td>Baseline ± 20%</td><td>Drop &gt; 50% → producer issue</td></tr>
+    <tr><td><code>produce-throttle-time-avg</code></td><td>0</td><td class="warn">&gt;0 → broker throttling this client</td></tr>
+    <tr><td><code>metadata-age</code></td><td>&lt;60s</td><td class="warn">&gt;300s → stale metadata, leader changes?</td></tr>
+  </table>
+</div>
+
+<!-- Consumer Metrics -->
+<div class="section" id="consumer-metrics">
+  <div class="section-header"><span class="section-icon">📥</span><span class="section-title">Consumer Client Metrics</span></div>
+
+  <table class="kv-table">
+    <tr><th>Metric</th><th>Normal Range</th><th>Alert When</th></tr>
+    <tr><td><code>records-lag-max</code></td><td>0 or low, stable</td><td class="warn">Growing trend over 10min</td></tr>
+    <tr><td><code>records-consumed-rate</code></td><td>Stable baseline</td><td>Sudden drop → consumer issue</td></tr>
+    <tr><td><code>bytes-consumed-rate</code></td><td>Stable baseline</td><td>Sudden drop → consumer issue</td></tr>
+    <tr><td><code>fetch-latency-avg</code></td><td>&lt;100ms</td><td class="warn">&gt;500ms → broker slow or network issue</td></tr>
+    <tr><td><code>poll-idle-ratio-avg</code></td><td>&gt;0.5 (50% idle)</td><td class="warn">&lt;0.1 → consumer CPU bound or slow processing</td></tr>
+    <tr><td><code>rebalance-rate-per-hour</code></td><td>&lt;1/hr</td><td class="warn">&gt;6/hr → rebalance storm</td></tr>
+    <tr><td><code>last-heartbeat-seconds-ago</code></td><td>&lt;3s</td><td class="warn">&gt;session.timeout.ms/2 → heartbeat issues</td></tr>
+    <tr><td><code>commit-latency-avg</code></td><td>&lt;50ms</td><td class="warn">&gt;500ms → group coordinator slow</td></tr>
+    <tr><td><code>fetch-throttle-time-avg</code></td><td>0</td><td class="warn">&gt;0 → broker throttling this consumer</td></tr>
+  </table>
+</div>
+
+<!-- Prometheus Setup -->
+<div class="section" id="prometheus">
+  <div class="section-header"><span class="section-icon">🔥</span><span class="section-title">Prometheus + JMX Exporter Setup</span></div>
+
+  <div class="diagram">  JMX EXPORTER (as Java agent on broker):
+  ──────────────────────────────────────────────────────────────────
+  # Start Kafka with JMX exporter agent:
+  EXTRA_ARGS="-javaagent:/opt/kafka/jmx_exporter.jar=7071:/opt/kafka/kafka-jmx-config.yml" \
+  kafka-server-start.sh /opt/kafka/config/server.properties
+
+  # kafka-jmx-config.yml (whitelist critical metrics):
+  rules:
+    - pattern: 'kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value'
+      name: kafka_server_replicamanager_underreplicatedpartitions
+    - pattern: 'kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec><>OneMinuteRate'
+      name: kafka_server_brokertopicmetrics_messagesinpersec_rate
+    - pattern: 'kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(.+)><>(\d+)thPercentile'
+      name: kafka_network_requestmetrics_totaltime_ms
+      labels:
+        request: "$1"
+        quantile: "0.$2"
+
+  PROMETHEUS SCRAPE CONFIG:
+  ──────────────────────────────────────────────────────────────────
+  # prometheus.yml
+  scrape_configs:
+    - job_name: kafka-brokers
+      static_configs:
+        - targets: ['broker1:7071', 'broker2:7071', 'broker3:7071']
+      scrape_interval: 15s
+      scrape_timeout: 10s
+
+    - job_name: kafka-connect
+      static_configs:
+        - targets: ['connect1:7072', 'connect2:7072']
+
+    - job_name: schema-registry
+      static_configs:
+        - targets: ['sr1:7073']</div>
+</div>
+
+<!-- Alerting Rules -->
+<div class="section" id="alerts">
+  <div class="section-header"><span class="section-icon">🚨</span><span class="section-title">Alerting Rules (Prometheus AlertManager)</span></div>
+
+  <div class="diagram">  CRITICAL ALERTS (page oncall immediately):
+  ──────────────────────────────────────────────────────────────────
+  - alert: KafkaUnderReplicatedPartitions
+    expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+    for: 1m
+    labels: { severity: critical }
+    annotations:
+      summary: "Kafka URP on {{ $labels.instance }}: {{ $value }} partitions"
+
+  - alert: KafkaOfflinePartitions
+    expr: kafka_controller_kafkacontroller_offlinepartitionscount > 0
+    for: 0m     # immediate — no leader means data unavailable
+    labels: { severity: critical }
+
+  - alert: KafkaActiveControllerCount
+    expr: kafka_controller_kafkacontroller_activecontrollercount != 1
+    for: 30s
+    labels: { severity: critical }
+    annotations:
+      summary: "Kafka controller count is {{ $value }}, expected 1"
+
+  WARNING ALERTS (notify, investigate within 1hr):
+  ──────────────────────────────────────────────────────────────────
+  - alert: KafkaConsumerLagGrowing
+    expr: |
+      increase(kafka_consumergroup_lag[10m]) > 100000
+    for: 10m
+    labels: { severity: warning }
+
+  - alert: KafkaBrokerDiskUsageHigh
+    expr: |
+      (node_filesystem_avail_bytes{mountpoint="/var/kafka"} /
+       node_filesystem_size_bytes{mountpoint="/var/kafka"}) < 0.2
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "Kafka disk {{ $labels.instance }} below 20% free"
+
+  - alert: KafkaRequestQueueHigh
+    expr: kafka_network_requestchannel_requestqueue_size > 200
+    for: 5m
+    labels: { severity: warning }
+
+  - alert: KafkaBrokerGCPauseHigh
+    expr: rate(jvm_gc_collection_seconds_sum[5m]) * 1000 > 100
+    for: 5m
+    labels: { severity: warning }
+    annotations:
+      summary: "Broker {{ $labels.instance }} GC taking >100ms/sec average"</div>
+</div>
+
+<!-- Consumer Lag Monitoring -->
+<div class="section" id="lag-monitoring">
+  <div class="section-header"><span class="section-icon">📉</span><span class="section-title">Consumer Lag Monitoring</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>kafka-consumer-groups.sh (CLI)</h4>
+      <p>Built-in tool. Good for ad-hoc checks. Not suitable for continuous monitoring — polling overhead and no historical tracking. Use for incident investigation, not alerting.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Burrow (LinkedIn)</h4>
+      <p>Dedicated consumer lag monitor. Reads <code>__consumer_offsets</code> directly. Provides lag status as OK/STALLED/STOPPED/ERR — not just a number. Has built-in alerting. REST API for integration. More operationally complex.</p>
+    </div>
+    <div class="concept-card">
+      <h4>kminion</h4>
+      <p>Modern Prometheus exporter for Kafka. Exports consumer group lag as Prometheus metrics. Simpler than Burrow. Good for Grafana-based monitoring stacks. Actively maintained.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Confluent Control Center</h4>
+      <p>Commercial product. Full monitoring UI including consumer lag, schema registry, Connect, ksqlDB. Built-in alerting. High operational value for large Kafka deployments. License cost.</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Interview insight:</strong> Consumer lag alone is not enough for alerting. A group with lag=1M that's DECREASING is healthy (catching up). A group with lag=1K that's INCREASING is concerning. Alert on <strong>lag growth rate</strong> (derivative), not absolute lag. Burrow's "STALLED" state detects this — consumer is committing offsets but lag is not decreasing.</div>
+  </div>
+
+  <div class="diagram">  PROMETHEUS QUERY FOR LAG ALERTING (growth rate):
+  ──────────────────────────────────────────────────────────────────
+  # Growing lag (increase over last 10 min, filter noise)
+  increase(kminion_consumer_group_topic_partition_lag[10m]) > 50000
+
+  # Rate of lag change per second (positive = growing, negative = catching up)
+  rate(kminion_consumer_group_topic_partition_lag[5m])
+
+  # Time to catch up (current lag / consumption rate - production rate)
+  # Useful for SLA estimation in dashboards</div>
+</div>
+
+<!-- Dashboard Essentials -->
+<div class="section" id="dashboard">
+  <div class="section-header"><span class="section-icon">🎛️</span><span class="section-title">Grafana Dashboard Essentials</span></div>
+
+  <table class="kv-table">
+    <tr><th>Dashboard</th><th>Key Panels</th></tr>
+    <tr><td><strong>Cluster Health</strong></td><td>Under-replicated partitions, Offline partitions, Active controller count, Broker count, Leader imbalance %</td></tr>
+    <tr><td><strong>Broker Performance</strong></td><td>Messages in/out/sec (per broker), Bytes in/out/sec, Request queue size, IO/Network thread idle %, Produce/Fetch latency p99</td></tr>
+    <tr><td><strong>Consumer Groups</strong></td><td>Lag per group/topic/partition (heatmap), Lag growth rate, Rebalance rate, Commit latency</td></tr>
+    <tr><td><strong>Topic Health</strong></td><td>Messages in/sec per topic, Bytes in/sec per topic, Log size per partition, Retention status</td></tr>
+    <tr><td><strong>JVM &amp; OS</strong></td><td>GC pause duration/frequency, Heap usage %, Disk usage per broker, Network I/O per broker, CPU usage</td></tr>
+    <tr><td><strong>Connect / SR</strong></td><td>Connector task status (RUNNING/FAILED), Source/Sink throughput, SR request latency, Schema registration rate</td></tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Ready-made dashboards:</strong> Grafana dashboard IDs for Kafka monitoring:<br>
+    • <strong>7589</strong> — Kafka Overview (JMX Exporter)<br>
+    • <strong>10973</strong> — Kafka Consumer Group Lag (kminion)<br>
+    • <strong>721</strong> — Kafka Confluent (all metrics)<br>
+    Import these as starting points and customize for your environment. Always tune alert thresholds based on your cluster's baseline behaviour, not generic defaults.</div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Observability Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        What's the first dashboard you'd look at during a Kafka incident at 3am?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        <strong>In order of priority:</strong>
+        <ol>
+          <li><strong>UnderReplicatedPartitions</strong> — Any value &gt; 0 means data durability is at risk. This is the single most important broker health metric. If URP &gt; 0, everything else is secondary until this is resolved.</li>
+          <li><strong>OfflinePartitionsCount</strong> — If any partition has no leader, that data is unavailable to producers and consumers. Immediate P1 impact.</li>
+          <li><strong>Consumer lag trend</strong> — Is the incident causing consumers to fall behind? Which groups? This tells you business impact.</li>
+          <li><strong>Request queue size + IO thread idle %</strong> — Is the broker keeping up with the load? If queue is growing, the broker is the bottleneck.</li>
+          <li><strong>Disk usage</strong> — Is the disk full? Quick sanity check that rules out a simple cause.</li>
+        </ol>
+        <strong>Within 2 minutes of waking up:</strong> URP? Offline? Lag growing? Disk full? If all are OK, dig deeper into latency metrics.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Prometheus shows consumer lag = 0 but records still seem delayed. How do you investigate?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Lag=0 means the consumer has committed offsets up to the latest offset. The delay is happening AFTER consumption:
+        <ul>
+          <li><strong>Processing time:</strong> Consumer fetches records and commits, but actual downstream processing (DB write, API call) happens asynchronously and is slow. The lag metric doesn't capture processing latency — only fetch position.</li>
+          <li><strong>End-to-end latency metric needed:</strong> Add a custom metric: timestamp when record was produced (in message headers or payload) vs timestamp when processing completed. This gives true end-to-end latency independent of Kafka lag.</li>
+          <li><strong>Auto-commit before processing:</strong> If <code>enable.auto.commit=true</code>, offsets are committed on a timer regardless of processing status. Lag=0 but records aren't processed yet.</li>
+          <li><strong>Check downstream:</strong> Is the DB slow? Is the downstream API backed up? Latency is in the sink, not Kafka.</li>
+        </ul>
+        <strong>Lesson:</strong> Consumer lag is a Kafka-level metric. Business SLA requires end-to-end latency tracking: produce-timestamp to processed-timestamp. Build that instrumentation into your application.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

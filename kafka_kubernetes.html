@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka on Kubernetes — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>☸️ Kafka on Kubernetes</h1>
+  <div class="header-right"><span class="pill pill-purple">Kubernetes</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#why-k8s">Why K8s for Kafka</a>
+  <a href="#strimzi">Strimzi Operator</a>
+  <a href="#crds">Strimzi CRDs</a>
+  <a href="#storage">Storage &amp; PVCs</a>
+  <a href="#resources">Resources &amp; Limits</a>
+  <a href="#networking">Networking</a>
+  <a href="#pdb">Pod Disruption Budgets</a>
+  <a href="#upgrades">Rolling Upgrades</a>
+  <a href="#kraft-k8s">KRaft on K8s</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Why K8s -->
+<div class="section" id="why-k8s">
+  <div class="section-header"><span class="section-icon">☸️</span><span class="section-title">Running Kafka on Kubernetes — Trade-offs</span></div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>Kafka on K8s</th><th>Kafka on VMs/Bare Metal</th></tr>
+    <tr><td>Operational consistency</td><td class="good">Uniform with other services (same CI/CD, GitOps)</td><td>Different tooling (Ansible, Puppet)</td></tr>
+    <tr><td>Resource efficiency</td><td class="good">Better bin-packing, shared cluster resources</td><td>Dedicated resources (more capacity)</td></tr>
+    <tr><td>Storage performance</td><td class="warn">Adds storage layers (PVC → PV → disk), potential latency</td><td class="good">Direct disk access, predictable I/O</td></tr>
+    <tr><td>Networking</td><td class="warn">Complex overlay network, additional hop, MTU issues</td><td class="good">Direct physical network</td></tr>
+    <tr><td>Stateful upgrades</td><td class="good">Operator handles rolling upgrade with health checks</td><td>Manual rolling restart procedure</td></tr>
+    <tr><td>Fault domains</td><td>Must configure pod anti-affinity for AZ spread</td><td class="good">Naturally physical host spread</td></tr>
+    <tr><td>Scale</td><td class="good">Easy horizontal scaling via operator CRD</td><td>Provisioning time for new VMs</td></tr>
+  </table>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>HSBC context:</strong> Many financial institutions run Kafka on VMs for predictable performance and regulatory isolation. K8s adoption for Kafka is growing but requires careful storage tuning. Key concern: noisy-neighbor effects from shared K8s nodes affecting Kafka I/O latency. Use dedicated node pools (node selectors/taints) for Kafka workloads.</div>
+  </div>
+</div>
+
+<!-- Strimzi -->
+<div class="section" id="strimzi">
+  <div class="section-header"><span class="section-icon">🎛️</span><span class="section-title">Strimzi Operator</span></div>
+
+  <div class="diagram">  STRIMZI OPERATOR ARCHITECTURE:
+  ──────────────────────────────────────────────────────────────────
+
+  kubectl apply -f kafka.yaml  (Kafka CRD)
+          │
+          ▼
+  Strimzi Cluster Operator (Deployment in kafka namespace)
+    Watches: Kafka, KafkaTopic, KafkaUser, KafkaConnect, KafkaMirrorMaker2...
+          │
+          ├── Reconciles Kafka CR → Creates/Updates:
+          │     StatefulSet (brokers)
+          │     StatefulSet (ZK or KRaft controllers)
+          │     Services (headless, external)
+          │     ConfigMaps (server.properties generated from CR)
+          │     Secrets (TLS certs, JAAS configs)
+          │     PodDisruptionBudgets
+          │
+          ├── Topic Operator:
+          │     Watches KafkaTopic CRs → calls Kafka AdminClient
+          │     Creates/updates topics in Kafka
+          │
+          └── User Operator:
+                Watches KafkaUser CRs → creates SCRAM users, ACLs
+                Stores credentials in K8s Secrets</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Cluster Operator</h4>
+      <p>Main operator component. Watches Kafka and related CRDs. Manages the full lifecycle: creation, configuration updates, rolling upgrades, TLS cert rotation, cluster scaling. Runs the reconciliation loop.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Topic Operator</h4>
+      <p>Watches <code>KafkaTopic</code> CRDs and reconciles with actual Kafka topics via AdminClient. Enables "topic as code" — define topics in Git, apply to cluster. Supports bidirectional sync (KafkaTopic CR → Kafka and Kafka → KafkaTopic CR).</p>
+    </div>
+    <div class="concept-card">
+      <h4>User Operator</h4>
+      <p>Watches <code>KafkaUser</code> CRDs. Creates/manages SCRAM users and ACLs. Stores generated passwords in K8s Secrets — applications reference the Secret, not hardcoded credentials.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Automated TLS</h4>
+      <p>Strimzi generates and manages all TLS certificates: cluster CA, client CA, broker certs, ZK certs. Handles automatic rotation (configurable). All inter-component communication is TLS by default — zero manual cert management.</p>
+    </div>
+  </div>
+</div>
+
+<!-- CRDs -->
+<div class="section" id="crds">
+  <div class="section-header"><span class="section-icon">📝</span><span class="section-title">Strimzi CRDs — Key Examples</span></div>
+
+  <div class="diagram">  KAFKA CLUSTER CR (kafka.yaml):
+  ──────────────────────────────────────────────────────────────────
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: Kafka
+  metadata:
+    name: kafka-production
+    namespace: kafka
+  spec:
+    kafka:
+      version: 3.7.0
+      replicas: 3
+      listeners:
+        - name: plain
+          port: 9092
+          type: internal
+          tls: false
+        - name: tls
+          port: 9093
+          type: internal
+          tls: true
+        - name: external
+          port: 9094
+          type: loadbalancer      # or: nodeport, ingress, route
+          tls: true
+      config:
+        offsets.topic.replication.factor: 3
+        transaction.state.log.replication.factor: 3
+        transaction.state.log.min.isr: 2
+        default.replication.factor: 3
+        min.insync.replicas: 2
+        auto.create.topics.enable: "false"   # Disable in production
+      storage:
+        type: jbod
+        volumes:
+          - id: 0
+            type: persistent-claim
+            size: 500Gi
+            class: kafka-ssd          # StorageClass name
+            deleteClaim: false        # Don't delete PVC when Kafka deleted
+      resources:
+        requests:
+          memory: 8Gi
+          cpu: "2"
+        limits:
+          memory: 8Gi
+          cpu: "4"
+      template:
+        pod:
+          affinity:
+            podAntiAffinity:          # Spread brokers across AZs
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: topology.kubernetes.io/zone
+    zookeeper:                        # Or use 'kraftMode' for KRaft
+      replicas: 3
+      storage:
+        type: persistent-claim
+        size: 10Gi
+        class: kafka-ssd
+    entityOperator:
+      topicOperator: {}
+      userOperator: {}
+
+  KAFKA TOPIC CR:
+  ──────────────────────────────────────────────────────────────────
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: KafkaTopic
+  metadata:
+    name: payments
+    namespace: kafka
+    labels:
+      strimzi.io/cluster: kafka-production
+  spec:
+    partitions: 24
+    replicas: 3
+    config:
+      retention.ms: "604800000"     # 7 days
+      min.insync.replicas: "2"
+      compression.type: lz4
+
+  KAFKA USER CR:
+  ──────────────────────────────────────────────────────────────────
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: KafkaUser
+  metadata:
+    name: payments-producer
+    namespace: kafka
+    labels:
+      strimzi.io/cluster: kafka-production
+  spec:
+    authentication:
+      type: scram-sha-512
+    authorization:
+      type: simple
+      acls:
+        - resource:
+            type: topic
+            name: payments
+          operations: [Write, Describe]
+        - resource:
+            type: cluster
+          operations: [IdempotentWrite]</div>
+</div>
+
+<!-- Storage -->
+<div class="section" id="storage">
+  <div class="section-header"><span class="section-icon">💾</span><span class="section-title">Storage &amp; PVCs</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>StorageClass Selection</h4>
+      <p>Use SSDs, not HDDs or network-attached storage (NFS, EFS). For AWS: <code>gp3</code> (3000 IOPS base, scalable) or <code>io2</code> (high IOPS). For GCP: <code>pd-ssd</code>. For Azure: <code>Premium_LRS</code>. Avoid shared storage — Kafka segments are sequential writes; shared storage adds latency.</p>
+    </div>
+    <div class="concept-card">
+      <h4>JBOD Storage</h4>
+      <p>Strimzi supports JBOD (multiple volumes per broker). Define multiple volumes in the CR — each gets its own PVC. Kafka distributes partition logs across volumes for higher I/O parallelism. Preferred over RAID from Kafka's perspective (Kafka handles replication, RAID adds write amplification).</p>
+    </div>
+    <div class="concept-card">
+      <h4>PVC Sizing</h4>
+      <p>Size = peak_throughput × retention_period × replication_factor ÷ num_brokers + 30% headroom. Always provision more than you think you need — PVC expansion is disruptive (may require pod restart). Alert at 70% usage.</p>
+    </div>
+    <div class="concept-card">
+      <h4>deleteClaim: false</h4>
+      <p>Critical setting — always set <code>deleteClaim: false</code> in production. If set to true, deleting the Kafka CR (even accidentally) deletes all PVCs and data. With false: data survives Kafka CR deletion. PVCs must be manually cleaned up.</p>
+    </div>
+  </div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Local PersistentVolumes (LocalPV):</strong> For best performance, use K8s Local PersistentVolumes — PVs backed by actual local NVMe disks on the node. This gives bare-metal disk performance. Trade-off: the pod MUST run on the same node as the disk (no live migration). Use with strict node assignment via StatefulSet volume claim templates + node selectors. Strimzi supports this out of the box.</div>
+  </div>
+</div>
+
+<!-- Resources -->
+<div class="section" id="resources">
+  <div class="section-header"><span class="section-icon">📦</span><span class="section-title">Resource Requests &amp; Limits</span></div>
+
+  <table class="kv-table">
+    <tr><th>Component</th><th>Memory Request/Limit</th><th>CPU Request/Limit</th><th>Notes</th></tr>
+    <tr><td>Kafka Broker</td><td>8Gi / 8Gi</td><td>2 / 4</td><td>Set request=limit for Guaranteed QoS. JVM heap = 6Gi (leave 2Gi for OS overhead + page cache within container).</td></tr>
+    <tr><td>ZooKeeper</td><td>2Gi / 2Gi</td><td>0.5 / 1</td><td>ZK is not memory-intensive. 2Gi sufficient for small clusters.</td></tr>
+    <tr><td>KRaft Controller</td><td>4Gi / 4Gi</td><td>1 / 2</td><td>Dedicated controller nodes. Less memory than brokers (no data path).</td></tr>
+    <tr><td>Kafka Connect</td><td>4Gi / 4Gi</td><td>1 / 2</td><td>Scale horizontally. Connector-specific (Debezium may need more).</td></tr>
+    <tr><td>ksqlDB</td><td>8Gi / 8Gi</td><td>2 / 4</td><td>RocksDB state stores can grow. Monitor disk usage on ksqlDB pods.</td></tr>
+    <tr><td>Schema Registry</td><td>1Gi / 2Gi</td><td>0.5 / 1</td><td>Stateless except for in-memory schema cache. Scales horizontally.</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Set request = limit for Kafka brokers (Guaranteed QoS).</strong> If a broker pod is Burstable or BestEffort QoS, the kernel's OOM killer may terminate it under memory pressure on the node — causing broker failures. Guaranteed QoS prevents this. Use dedicated node pools with no other workloads for predictable performance.</div>
+  </div>
+</div>
+
+<!-- Networking -->
+<div class="section" id="networking">
+  <div class="section-header"><span class="section-icon">🌐</span><span class="section-title">Kafka Networking on Kubernetes</span></div>
+
+  <div class="diagram">  INTERNAL (within cluster) ACCESS:
+  ──────────────────────────────────────────────────────────────────
+  Kafka brokers: StatefulSet pods get stable DNS names:
+  kafka-production-kafka-0.kafka-production-kafka-brokers.kafka.svc.cluster.local:9092
+  kafka-production-kafka-1.kafka-production-kafka-brokers.kafka.svc.cluster.local:9092
+  ...
+
+  Bootstrap address (clients use this initially, then get partition metadata):
+  kafka-production-kafka-bootstrap.kafka.svc.cluster.local:9092
+
+  EXTERNAL ACCESS OPTIONS:
+  ──────────────────────────────────────────────────────────────────
+  type: loadbalancer
+    - Creates one LB per broker (Strimzi per-broker LoadBalancer)
+    - Each broker gets its own external IP
+    - Works out of the box for AWS NLB, GCP LB, Azure LB
+    - Cost: multiple load balancers
+
+  type: nodeport
+    - Maps broker ports to NodePorts
+    - Client connects to any node IP + NodePort
+    - K8s routes to correct broker
+    - Works for on-prem; performance depends on node network
+
+  type: ingress (with NGINX or Traefik)
+    - Routes by SNI (TLS required)
+    - Single entry point, routes to correct broker by hostname
+    - Complex but cost-effective for many brokers
+
+  type: route (OpenShift only)
+    - OpenShift Route resource
+    - External access via OpenShift router
+
+  ADVERTISED LISTENERS (critical):
+    Strimzi auto-configures advertised.listeners with the external address.
+    Without this, clients get internal addresses that are unreachable externally.
+    Strimzi solves the "broker returns wrong advertised address" problem automatically.</div>
+</div>
+
+<!-- PDB -->
+<div class="section" id="pdb">
+  <div class="section-header"><span class="section-icon">🛡️</span><span class="section-title">Pod Disruption Budgets</span></div>
+
+  <div class="diagram">  STRIMZI AUTO-CREATES PDB:
+  ──────────────────────────────────────────────────────────────────
+  # For 3 Kafka brokers, Strimzi creates:
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata:
+    name: kafka-production-kafka
+  spec:
+    maxUnavailable: 1          # At most 1 broker can be disrupted at once
+    selector:
+      matchLabels:
+        strimzi.io/name: kafka-production-kafka
+
+  EFFECT:
+  - kubectl drain node-1 → Kubernetes checks PDB before evicting pods
+  - If Kafka broker on node-1 is the only disruption → allowed (maxUnavailable=1)
+  - If another broker is already down → kubectl drain BLOCKED until first recovers
+  - Prevents accidental multi-broker failure during K8s node maintenance
+
+  PDB TUNING:
+  - maxUnavailable=1 is standard for 3-broker clusters (RF=3, tolerates 1 failure)
+  - For 5-broker clusters: maxUnavailable=2 is safe
+  - ZooKeeper PDB: maxUnavailable=1 (ZK 3-node needs 2 for quorum)</div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Interview tip:</strong> PDBs protect against voluntary disruptions (node drain, cluster upgrades). They do NOT protect against involuntary disruptions (node crash, OOM kill). For involuntary failures: replication factor + min.insync.replicas are the protection. PDB and RF/ISR are complementary, not alternatives.</div>
+  </div>
+</div>
+
+<!-- Rolling Upgrades -->
+<div class="section" id="upgrades">
+  <div class="section-header"><span class="section-icon">🔄</span><span class="section-title">Rolling Upgrades via Strimzi</span></div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Update Kafka version in CR</strong><br>Change <code>spec.kafka.version: 3.7.0</code> to <code>3.8.0</code>. Also update <code>inter.broker.protocol.version</code> and <code>log.message.format.version</code> to the old version first (two-phase upgrade).</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Strimzi Cluster Operator detects the change</strong><br>Operator reconciliation loop detects CR diff. Plans a rolling update of the StatefulSet. Uses the same rolling restart protocol as manual operations (one pod at a time, health check before next).</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Pod restart with health checks</strong><br>Strimzi waits for each broker pod to be Ready (readiness probe passes). Readiness probe checks broker is accepting connections. Additionally checks UnderReplicatedPartitions = 0 before proceeding to the next broker.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Update inter-broker protocol version</strong><br>After all brokers are on new Kafka version: update <code>inter.broker.protocol.version</code> to the new version in the CR. This triggers another rolling restart to enable new protocol features.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Verify and monitor</strong><br>Watch operator logs: <code>kubectl logs deployment/strimzi-cluster-operator -n kafka -f</code>. Watch for URP alerts during upgrade. Whole process is automated — no manual intervention needed.</div></div>
+  </div>
+</div>
+
+<!-- KRaft on K8s -->
+<div class="section" id="kraft-k8s">
+  <div class="section-header"><span class="section-icon">🏛️</span><span class="section-title">KRaft on Kubernetes (Strimzi)</span></div>
+
+  <div class="diagram">  KRAFT CONFIG IN STRIMZI CR (Strimzi 0.35+):
+  ──────────────────────────────────────────────────────────────────
+  spec:
+    kafka:
+      version: 3.7.0
+      # Remove zookeeper section entirely for KRaft
+      metadataVersion: 3.7-IV4     # KRaft metadata version
+      replicas: 3
+      # Brokers can be combined mode or separate
+      # For separate controller nodes use KafkaNodePool (Strimzi 0.36+)
+
+  # KafkaNodePool (separate controller nodes):
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: KafkaNodePool
+  metadata:
+    name: controller
+    labels:
+      strimzi.io/cluster: kafka-production
+  spec:
+    replicas: 3
+    roles: [controller]             # Only controller role
+    storage:
+      type: persistent-claim
+      size: 10Gi
+      class: kafka-ssd
+  ---
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: KafkaNodePool
+  metadata:
+    name: broker
+    labels:
+      strimzi.io/cluster: kafka-production
+  spec:
+    replicas: 3
+    roles: [broker]                 # Only broker role
+    storage:
+      type: persistent-claim
+      size: 500Gi
+      class: kafka-ssd</div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Kubernetes Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A Kafka broker pod is evicted due to memory pressure on the node. What happens to data and how do you prevent this?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        <strong>What happens to data:</strong> The broker pod dies. Other brokers detect it via heartbeat/ZK timeout. Leader elections occur for partitions led by the evicted broker. Followers in ISR become new leaders. Data written to the evicted broker's ISR partitions is safe (replicated). Data NOT yet replicated to any ISR follower (possible with acks=1) could be lost if the evicted broker's disk is also gone.
+        <br><br>
+        <strong>Prevention:</strong>
+        <ol>
+          <li><strong>Set requests=limits (Guaranteed QoS):</strong> K8s evicts BestEffort pods first, then Burstable. Guaranteed QoS pods are only evicted as last resort (system critical processes at risk). Kafka brokers should be Guaranteed QoS.</li>
+          <li><strong>Dedicated node pool:</strong> Use dedicated K8s nodes for Kafka (node selector/taints). No other workloads compete for memory on broker nodes.</li>
+          <li><strong>Set correct JVM heap:</strong> Oversized heap → pod memory limit approached → OOM kill by K8s. Kubernetes memory limit = JVM heap + off-heap (page cache, NIO buffers, metaspace). Set limit ~= 2× JVM heap.</li>
+          <li><strong>PDB:</strong> PDB prevents voluntary eviction of too many pods at once but doesn't prevent OOM eviction (involuntary).</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How does Strimzi solve the "advertised.listeners" problem that makes Kafka tricky on K8s?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        The core problem: Kafka brokers return their <code>advertised.listeners</code> in metadata responses. After a client bootstraps, it's told "connect to broker-1 at broker1.kafka.svc.cluster.local:9092." If the client is external (outside the cluster), this internal DNS name is unreachable.
+        <br><br>
+        <strong>Strimzi's solution:</strong> It configures EACH broker with the correct listener for each access route:
+        <ul>
+          <li>Internal listener: <code>kafka-production-kafka-0.kafka-production-kafka-brokers.kafka.svc.cluster.local:9092</code></li>
+          <li>External listener: auto-detected external IP/DNS from the LoadBalancer/NodePort service for that specific pod</li>
+        </ul>
+        Each pod gets its own Service (e.g., <code>kafka-production-kafka-0</code>) with its own external address. Strimzi watches for the external IP assignment from the cloud provider LB and patches each broker's <code>advertised.listeners</code> with the correct per-broker external address. Clients bootstrapping externally get metadata pointing to per-broker external addresses — and can connect to any broker directly.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

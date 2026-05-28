@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka SRE Interview Prep — HSBC Associate Director</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #5b8df6;
+      --accent2: #7c5cbf;
+      --green: #3ecf8e;
+      --yellow: #f5a623;
+      --red: #e05252;
+      --text: #e2e8f0;
+      --muted: #7b859c;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    header {
+      background: linear-gradient(135deg, #1a1d27 0%, #0d1020 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 28px 40px;
+    }
+    header .role-tag {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    header h1 {
+      font-size: 26px;
+      font-weight: 700;
+      color: #fff;
+    }
+    header p {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .header-meta {
+      margin-top: 14px;
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .badge .dot { width: 7px; height: 7px; border-radius: 50%; }
+    .dot-green  { background: var(--green); }
+    .dot-yellow { background: var(--yellow); }
+    .dot-blue   { background: var(--accent); }
+
+    main {
+      max-width: 1100px;
+      margin: 40px auto;
+      padding: 0 24px;
+    }
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .topic-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 18px;
+      margin-bottom: 48px;
+    }
+    .topic-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      text-decoration: none;
+      color: inherit;
+      transition: border-color .2s, transform .15s;
+      display: block;
+    }
+    .topic-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .card-icon { font-size: 26px; margin-bottom: 12px; }
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 6px;
+    }
+    .card-desc {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+      margin-bottom: 14px;
+    }
+    .card-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .pill {
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 20px;
+      padding: 3px 10px;
+    }
+    .pill-blue   { background: rgba(91,141,246,.15); color: var(--accent); }
+    .pill-green  { background: rgba(62,207,142,.15); color: var(--green); }
+    .pill-purple { background: rgba(124,92,191,.15); color: var(--accent2); }
+    .pill-yellow { background: rgba(245,166,35,.15); color: var(--yellow); }
+    .pill-red    { background: rgba(224,82,82,.15);  color: var(--red); }
+    .pill-teal   { background: rgba(56,189,193,.15); color: #38bdc1; }
+
+    .card-status { font-size: 12px; color: var(--muted); }
+    .card-status.complete { color: var(--green); font-weight: 600; }
+
+    .jd-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin-bottom: 48px;
+    }
+    .jd-box h3 {
+      font-size: 14px;
+      color: var(--accent);
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+    .jd-box ul {
+      list-style: none;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 32px;
+    }
+    .jd-box ul li {
+      font-size: 13px;
+      color: var(--muted);
+      padding-left: 14px;
+      position: relative;
+    }
+    .jd-box ul li::before {
+      content: '▸';
+      position: absolute;
+      left: 0;
+      color: var(--accent);
+    }
+    .progress-bar-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 24px;
+      margin-bottom: 48px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .progress-bar-bg {
+      flex: 1;
+      height: 8px;
+      background: var(--surface2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+    }
+    .progress-label {
+      font-size: 13px;
+      color: var(--green);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    @media (max-width: 600px) {
+      .jd-box ul { grid-template-columns: 1fr; }
+      header { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="role-tag">Interview Prep</div>
+  <h1>Kafka SRE — Associate Director</h1>
+  <p>HSBC &nbsp;·&nbsp; Pune Division, Maharashtra &nbsp;·&nbsp; Hybrid</p>
+  <div class="header-meta">
+    <span class="badge"><span class="dot dot-blue"></span> 10+ yrs overall</span>
+    <span class="badge"><span class="dot dot-yellow"></span> 7-10 yrs Kafka</span>
+    <span class="badge"><span class="dot dot-green"></span> Kubernetes preferred</span>
+    <span class="badge"><span class="dot dot-blue"></span> Weekend support required</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Progress -->
+  <div class="progress-bar-wrap">
+    <span style="font-size:13px;color:var(--muted);">Prep progress</span>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" style="width:100%"></div>
+    </div>
+    <span class="progress-label">17 / 17 topics complete</span>
+  </div>
+
+  <!-- JD Key Requirements -->
+  <div class="jd-box">
+    <h3>Key Requirements from JD</h3>
+    <ul>
+      <li>Kafka reliability, performance &amp; scalability</li>
+      <li>Kafka deployment, configuration &amp; maintenance</li>
+      <li>Incident troubleshooting &amp; root cause analysis</li>
+      <li>Containerization &amp; orchestration (Kubernetes)</li>
+      <li>Infrastructure as Code (IaC)</li>
+      <li>Observability &amp; logging tools</li>
+      <li>Unix administration skills</li>
+      <li>Process automation in production environments</li>
+    </ul>
+  </div>
+
+  <!-- Platform Design -->
+  <p class="section-title">Platform Design</p>
+  <div class="topic-grid">
+
+    <a href="kafka_cluster_design.html" class="topic-card" style="border-left: 3px solid var(--accent);">
+      <div class="card-icon">🏛️</div>
+      <div class="card-title">Kafka Platform Design Guide</div>
+      <div class="card-desc">End-to-end cluster design: sizing, hardware, rack awareness, min.ISR, RPO/RTO, DR &amp; failover, observability stack, zero-downtime patching, version upgrades, IaC tooling, password rotation, producer/consumer best practices, partition strategy, HA for all components.</div>
+      <div class="card-footer">
+        <span class="pill pill-blue">Design</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+  <!-- Core Concepts & Architecture -->
+  <p class="section-title">Core Concepts &amp; Architecture</p>
+  <div class="topic-grid">
+
+    <a href="kafka_core_concepts.html" class="topic-card">
+      <div class="card-icon">⚙️</div>
+      <div class="card-title">Kafka Core Concepts</div>
+      <div class="card-desc">Topics, partitions, brokers, consumer groups, offsets, replication, ISR, leaders, ZooKeeper vs KRaft, delivery guarantees.</div>
+      <div class="card-footer">
+        <span class="pill pill-blue">Concepts</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_architecture.html" class="topic-card">
+      <div class="card-icon">🏗️</div>
+      <div class="card-title">Kafka Architecture &amp; Internals</div>
+      <div class="card-desc">Broker thread model, request/response queues, log segments, page cache, zero-copy, producer &amp; consumer internals, purgatory.</div>
+      <div class="card-footer">
+        <span class="pill pill-blue">Concepts</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_zk_kraft_migration.html" class="topic-card">
+      <div class="card-icon">🔀</div>
+      <div class="card-title">ZooKeeper → KRaft Migration</div>
+      <div class="card-desc">ZK vs KRaft architecture, Raft consensus, 7-step migration procedure, rollback strategy, gotchas, scenario Q&amp;As.</div>
+      <div class="card-footer">
+        <span class="pill pill-blue">Concepts</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+  <!-- Ecosystem Components -->
+  <p class="section-title">Ecosystem Components</p>
+  <div class="topic-grid">
+
+    <a href="kafka_schema_registry.html" class="topic-card">
+      <div class="card-icon">📋</div>
+      <div class="card-title">Schema Registry</div>
+      <div class="card-desc">Wire format, Avro/Protobuf/JSON Schema, compatibility modes (BACKWARD, FORWARD, FULL), subject strategies, HA, REST API.</div>
+      <div class="card-footer">
+        <span class="pill pill-teal">Component</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_connect.html" class="topic-card">
+      <div class="card-icon">🔌</div>
+      <div class="card-title">Kafka Connect</div>
+      <div class="card-desc">Distributed vs standalone, workers/connectors/tasks, offset management, DLQ, SMTs, EOS, Debezium, S3 Sink, REST API.</div>
+      <div class="card-footer">
+        <span class="pill pill-teal">Component</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_ksqldb.html" class="topic-card">
+      <div class="card-icon">🧮</div>
+      <div class="card-title">ksqlDB</div>
+      <div class="card-desc">Streams vs Tables, push/pull queries, windowing (tumbling/hopping/session), joins, RocksDB state stores, UDFs, deployment modes.</div>
+      <div class="card-footer">
+        <span class="pill pill-teal">Component</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_rest_proxy.html" class="topic-card">
+      <div class="card-icon">🌐</div>
+      <div class="card-title">REST Proxy</div>
+      <div class="card-desc">Stateful consumer sessions, produce/consume lifecycle, sticky routing requirement, formats, limitations, when to use.</div>
+      <div class="card-footer">
+        <span class="pill pill-teal">Component</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+  <!-- Operations & SRE -->
+  <p class="section-title">Operations &amp; SRE</p>
+  <div class="topic-grid">
+
+    <a href="kafka_operations.html" class="topic-card">
+      <div class="card-icon">🔧</div>
+      <div class="card-title">Kafka Administration &amp; Ops</div>
+      <div class="card-desc">Producer/consumer slowness checklists, partition reassignment, rolling restarts, topic management, leader balancing, quotas, offsets.</div>
+      <div class="card-footer">
+        <span class="pill pill-green">Ops</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_reliability_sre.html" class="topic-card">
+      <div class="card-icon">🛡️</div>
+      <div class="card-title">Reliability &amp; SRE</div>
+      <div class="card-desc">SLOs, error budgets, incident runbooks, failure mode analysis (broker/ZK/network/disk), DR planning, chaos engineering.</div>
+      <div class="card-footer">
+        <span class="pill pill-green">SRE</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_performance.html" class="topic-card">
+      <div class="card-icon">📈</div>
+      <div class="card-title">Performance &amp; Tuning</div>
+      <div class="card-desc">Producer/consumer/broker tuning tables, JVM G1GC, OS tuning (vm.swappiness, XFS, io scheduler), benchmarking tools.</div>
+      <div class="card-footer">
+        <span class="pill pill-green">Ops</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_security.html" class="topic-card">
+      <div class="card-icon">🔐</div>
+      <div class="card-title">Security</div>
+      <div class="card-desc">TLS/SSL, SASL (PLAIN, SCRAM-SHA-512, Kerberos, OAUTHBEARER), ACLs, inter-broker auth, encryption at rest, audit logging.</div>
+      <div class="card-footer">
+        <span class="pill pill-red">Security</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+  <!-- Infrastructure & Platform -->
+  <p class="section-title">Infrastructure &amp; Platform</p>
+  <div class="topic-grid">
+
+    <a href="kafka_kubernetes.html" class="topic-card">
+      <div class="card-icon">☸️</div>
+      <div class="card-title">Kafka on Kubernetes</div>
+      <div class="card-desc">Strimzi operator, StatefulSets, JBOD storage, PVCs, PDB, Guaranteed QoS, rolling upgrades, KRaft on K8s, external access.</div>
+      <div class="card-footer">
+        <span class="pill pill-purple">Kubernetes</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_observability.html" class="topic-card">
+      <div class="card-icon">📊</div>
+      <div class="card-title">Observability &amp; Monitoring</div>
+      <div class="card-desc">JMX → Prometheus → Grafana stack, critical broker metrics, AlertManager rules, consumer lag (Burrow/kminion), dashboards.</div>
+      <div class="card-footer">
+        <span class="pill pill-purple">Observability</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="kafka_iac_automation.html" class="topic-card">
+      <div class="card-icon">🤖</div>
+      <div class="card-title">IaC &amp; Automation</div>
+      <div class="card-desc">Terraform (MSK, Confluent Cloud, self-managed), Ansible rolling restart, Helm (Strimzi/Bitnami), GitOps/ArgoCD, CI/CD for connectors, topic-as-code.</div>
+      <div class="card-footer">
+        <span class="pill pill-purple">IaC</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+  <!-- Scenario-Based Questions -->
+  <p class="section-title">Scenario-Based Questions</p>
+  <div class="topic-grid">
+
+    <a href="scenarios_production_incidents.html" class="topic-card">
+      <div class="card-icon">🚨</div>
+      <div class="card-title">Production Incident Scenarios</div>
+      <div class="card-desc">10 scenarios: consumer lag spikes, broker disk full, leader election storm, ISR shrinkage, data loss, producer backpressure, rebalance loop.</div>
+      <div class="card-footer">
+        <span class="pill pill-yellow">Scenarios</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+    <a href="scenarios_design.html" class="topic-card">
+      <div class="card-icon">🗺️</div>
+      <div class="card-title">Design &amp; Architecture Scenarios</div>
+      <div class="card-desc">7 designs: high-throughput pipeline, multi-DC replication (MM2), exactly-once payments, schema evolution, KEDA autoscaling, tiered storage.</div>
+      <div class="card-footer">
+        <span class="pill pill-yellow">Scenarios</span>
+        <span class="card-status complete">● Complete</span>
+      </div>
+    </a>
+
+  </div>
+
+</main>
+</body>
+</html>

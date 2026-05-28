@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka IaC &amp; Automation | HSBC Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <div class="header-role">HSBC · Associate Director · Kafka SRE</div>
+      <h1>IaC &amp; Automation</h1>
+      <p style="color:var(--text-muted);margin:0">Terraform, Ansible, Helm, GitOps, CI/CD for Kafka</p>
+    </div>
+    <a href="index.html" class="btn-back">← Hub</a>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="toc">
+    <div class="toc-title">Contents</div>
+    <a href="#terraform">Terraform</a>
+    <a href="#ansible">Ansible</a>
+    <a href="#helm">Helm Charts</a>
+    <a href="#gitops">GitOps / ArgoCD</a>
+    <a href="#cicd">CI/CD for Connectors</a>
+    <a href="#topic-as-code">Topic as Code</a>
+    <a href="#qa">Q &amp; A</a>
+  </nav>
+
+  <main>
+
+    <!-- Terraform -->
+    <section id="terraform">
+      <h2>Terraform for Kafka</h2>
+
+      <div class="concept-card">
+        <h3>Provider Landscape</h3>
+        <table class="kv-table">
+          <thead><tr><th>Provider</th><th>Use Case</th><th>Registry</th></tr></thead>
+          <tbody>
+            <tr><td><code>hashicorp/aws</code> (MSK)</td><td>AWS Managed Streaming for Kafka</td><td>registry.terraform.io/hashicorp/aws</td></tr>
+            <tr><td><code>confluentinc/confluent</code></td><td>Confluent Cloud clusters, topics, service accounts, ACLs, connectors</td><td>registry.terraform.io/confluentinc/confluent</td></tr>
+            <tr><td><code>Mongey/kafka</code></td><td>Self-managed Kafka: topics, ACLs, quotas</td><td>registry.terraform.io/Mongey/kafka</td></tr>
+            <tr><td><code>hashicorp/kubernetes</code></td><td>Strimzi CRDs (KafkaCluster, KafkaTopic via kubectl-apply or helm)</td><td>registry.terraform.io/hashicorp/kubernetes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>AWS MSK with Terraform</h3>
+        <div class="diagram"><pre>
+# versions.tf
+terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+  backend "s3" {
+    bucket         = "myorg-terraform-state"
+    key            = "kafka/msk/terraform.tfstate"
+    region         = "ap-south-1"
+    encrypt        = true
+    dynamodb_table = "terraform-locks"
+  }
+}
+
+# msk_cluster.tf
+resource "aws_msk_cluster" "kafka" {
+  cluster_name           = "hsbc-payments-kafka"
+  kafka_version          = "3.6.0"
+  number_of_broker_nodes = 6          # 2 per AZ × 3 AZs
+
+  broker_node_group_info {
+    instance_type   = "kafka.m5.4xlarge"
+    client_subnets  = var.private_subnet_ids    # 3 subnets, 1 per AZ
+    security_groups = [aws_security_group.msk.id]
+
+    storage_info {
+      ebs_storage_info {
+        volume_size            = 2000   # GB per broker
+        provisioned_throughput {
+          enabled           = true
+          volume_throughput = 250       # MiB/s
+        }
+      }
+    }
+  }
+
+  encryption_info {
+    encryption_in_transit {
+      client_broker = "TLS"
+      in_cluster    = true
+    }
+    encryption_at_rest_kms_key_arn = aws_kms_key.msk.arn
+  }
+
+  client_authentication {
+    sasl {
+      scram = true        # SASL/SCRAM via Secrets Manager
+      iam   = true        # AWS IAM authentication
+    }
+    tls {
+      certificate_authority_arns = [aws_acmpca_certificate_authority.kafka.arn]
+    }
+  }
+
+  configuration_info {
+    arn      = aws_msk_configuration.kafka.arn
+    revision = aws_msk_configuration.kafka.latest_revision
+  }
+
+  open_monitoring {
+    prometheus {
+      jmx_exporter  { enabled_in_broker = true }
+      node_exporter { enabled_in_broker = true }
+    }
+  }
+
+  logging_config {
+    broker_logs {
+      cloudwatch_logs {
+        enabled   = true
+        log_group = "/msk/hsbc-payments-kafka/broker"
+      }
+    }
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_msk_configuration" "kafka" {
+  name           = "hsbc-kafka-config"
+  kafka_versions = ["3.6.0"]
+  server_properties = &lt;&lt;-EOT
+    auto.create.topics.enable=false
+    default.replication.factor=3
+    min.insync.replicas=2
+    num.io.threads=16
+    num.network.threads=5
+    num.partitions=12
+    unclean.leader.election.enable=false
+    log.retention.hours=168
+    log.segment.bytes=1073741824
+    compression.type=lz4
+  EOT
+}
+
+# outputs.tf
+output "bootstrap_brokers_tls" {
+  value     = aws_msk_cluster.kafka.bootstrap_brokers_tls
+  sensitive = true
+}
+output "zookeeper_connect_string" {
+  value     = aws_msk_cluster.kafka.zookeeper_connect_string
+}
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Confluent Cloud with Terraform</h3>
+        <div class="diagram"><pre>
+# confluent_kafka.tf
+provider "confluent" {
+  cloud_api_key    = var.confluent_cloud_api_key
+  cloud_api_secret = var.confluent_cloud_api_secret
+}
+
+resource "confluent_environment" "prod" {
+  display_name = "production"
+}
+
+resource "confluent_kafka_cluster" "dedicated" {
+  display_name = "hsbc-payments"
+  availability = "MULTI_ZONE"
+  cloud        = "AWS"
+  region       = "ap-south-1"
+
+  dedicated {
+    cku = 4    # Confluent Kafka Units
+  }
+
+  environment { id = confluent_environment.prod.id }
+}
+
+resource "confluent_service_account" "payments_producer" {
+  display_name = "payments-producer-sa"
+  description  = "Service account for payments producer"
+}
+
+resource "confluent_api_key" "payments_producer_key" {
+  display_name = "payments-producer-key"
+  owner {
+    id          = confluent_service_account.payments_producer.id
+    api_version = confluent_service_account.payments_producer.api_version
+    kind        = confluent_service_account.payments_producer.kind
+  }
+  managed_resource {
+    id          = confluent_kafka_cluster.dedicated.id
+    api_version = confluent_kafka_cluster.dedicated.api_version
+    kind        = confluent_kafka_cluster.dedicated.kind
+    environment { id = confluent_environment.prod.id }
+  }
+}
+
+resource "confluent_kafka_acl" "payments_producer_write" {
+  kafka_cluster { id = confluent_kafka_cluster.dedicated.id }
+  resource_type = "TOPIC"
+  resource_name = "payments."
+  pattern_type  = "PREFIXED"
+  principal     = "User:${confluent_service_account.payments_producer.id}"
+  host          = "*"
+  operation     = "WRITE"
+  permission    = "ALLOW"
+  rest_endpoint = confluent_kafka_cluster.dedicated.rest_endpoint
+
+  credentials {
+    key    = confluent_api_key.admin_key.id
+    secret = confluent_api_key.admin_key.secret
+  }
+}
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Self-Managed Kafka Topics &amp; ACLs with Terraform (Mongey/kafka)</h3>
+        <div class="diagram"><pre>
+provider "kafka" {
+  bootstrap_servers = ["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+  tls_enabled       = true
+  sasl_username     = var.kafka_admin_user
+  sasl_password     = var.kafka_admin_password
+  sasl_mechanism    = "scram-sha512"
+}
+
+resource "kafka_topic" "payments" {
+  name               = "payments.transactions.v1"
+  replication_factor = 3
+  partitions         = 24
+
+  config = {
+    "cleanup.policy"          = "delete"
+    "retention.ms"            = "604800000"   # 7 days
+    "min.insync.replicas"     = "2"
+    "compression.type"        = "lz4"
+    "max.message.bytes"       = "1048576"     # 1MB
+    "segment.bytes"           = "1073741824"  # 1GB
+  }
+}
+
+resource "kafka_acl" "payments_producer" {
+  resource_name       = "payments.transactions"
+  resource_type       = "Topic"
+  acl_principal       = "User:payments-service"
+  acl_host            = "*"
+  acl_operation       = "Write"
+  acl_permission_type = "Allow"
+  resource_pattern_type_filter = "Prefixed"
+}
+
+resource "kafka_acl" "payments_consumer" {
+  resource_name       = "payments-consumer-group"
+  resource_type       = "Group"
+  acl_principal       = "User:payments-consumer"
+  acl_host            = "*"
+  acl_operation       = "Read"
+  acl_permission_type = "Allow"
+}
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Terraform Best Practices for Kafka</h3>
+        <ul class="checklist">
+          <li>Use <strong>remote state</strong> (S3 + DynamoDB lock) — Kafka topic changes from two engineers simultaneously can cause drift</li>
+          <li>Use <strong>workspaces</strong> or <strong>separate state files</strong> per environment (dev/staging/prod)</li>
+          <li><code>terraform plan</code> in CI, <code>terraform apply</code> only via protected main branch with approval gate</li>
+          <li>Never store Kafka credentials in <code>.tfvars</code> files. Use Vault, AWS Secrets Manager, or environment variables</li>
+          <li>Import existing topics before creating: <code>terraform import kafka_topic.payments payments.transactions.v1</code></li>
+          <li>Set <code>prevent_destroy = true</code> on critical topics to require two-step deletion</li>
+          <li>Use <code>lifecycle { ignore_changes = [config["retention.ms"]] }</code> for configs managed operationally</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Ansible -->
+    <section id="ansible">
+      <h2>Ansible for Kafka Broker Management</h2>
+
+      <div class="concept-card">
+        <h3>Ansible Role Structure</h3>
+        <div class="diagram"><pre>
+roles/kafka_broker/
+├── defaults/
+│   └── main.yml         # Default variables (overridable)
+├── tasks/
+│   ├── main.yml         # Entry point
+│   ├── install.yml      # Package install
+│   ├── configure.yml    # server.properties template
+│   ├── tls.yml          # Keystore/truststore setup
+│   └── service.yml      # systemd service
+├── templates/
+│   ├── server.properties.j2
+│   └── kafka.service.j2
+├── handlers/
+│   └── main.yml         # restart kafka handler
+└── vars/
+    └── main.yml         # Role-specific constants
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Rolling Restart Playbook</h3>
+        <div class="diagram"><pre>
+# rolling_restart.yml
+---
+- name: Kafka Rolling Restart
+  hosts: kafka_brokers
+  serial: 1                    # One broker at a time
+  max_fail_percentage: 0       # Stop on any failure
+  gather_facts: true
+
+  pre_tasks:
+    - name: Check UnderReplicatedPartitions before restart
+      command: >
+        kafka-topics.sh --bootstrap-server {{ groups['kafka_brokers'][0] }}:9092
+        --describe --under-replicated-partitions
+      register: urp_check
+      changed_when: false
+      delegate_to: "{{ groups['kafka_brokers'][0] }}"
+
+    - name: Fail if URPs exist before restart
+      fail:
+        msg: "UnderReplicatedPartitions detected! Fix before restarting. Output: {{ urp_check.stdout }}"
+      when: urp_check.stdout | length > 0
+
+    - name: Set controlled shutdown flag
+      lineinfile:
+        path: /opt/kafka/config/server.properties
+        regexp: "^controlled.shutdown.enable"
+        line: "controlled.shutdown.enable=true"
+
+  tasks:
+    - name: Restart Kafka broker
+      systemd:
+        name: kafka
+        state: restarted
+
+    - name: Wait for broker to rejoin cluster (port 9092 listening)
+      wait_for:
+        port: 9092
+        timeout: 120
+
+    - name: Wait for URPs to return to 0 after restart
+      shell: >
+        kafka-topics.sh --bootstrap-server {{ groups['kafka_brokers'][0] }}:9092
+        --describe --under-replicated-partitions | wc -l
+      register: urp_count
+      until: urp_count.stdout | int == 0
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['kafka_brokers'][0] }}"
+      changed_when: false
+
+  post_tasks:
+    - name: Verify broker is in ISR
+      debug:
+        msg: "Broker {{ inventory_hostname }} restarted successfully. URP count: {{ urp_count.stdout }}"
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>server.properties Jinja2 Template</h3>
+        <div class="diagram"><pre>
+# templates/server.properties.j2
+broker.id={{ kafka_broker_id }}
+node.id={{ kafka_broker_id }}
+
+# KRaft mode
+process.roles=broker
+controller.quorum.voters={{ kafka_controller_quorum_voters }}
+controller.listener.names=CONTROLLER
+
+# Listeners
+listeners=PLAINTEXT://:9092,SSL://:9093,CONTROLLER://:9094
+advertised.listeners=PLAINTEXT://{{ ansible_hostname }}:9092,SSL://{{ ansible_fqdn }}:9093
+listener.security.protocol.map=PLAINTEXT:PLAINTEXT,SSL:SSL,CONTROLLER:PLAINTEXT
+inter.broker.listener.name=SSL
+
+# Storage (JBOD)
+log.dirs={{ kafka_log_dirs | join(',') }}
+
+# Replication
+default.replication.factor={{ kafka_replication_factor | default(3) }}
+min.insync.replicas={{ kafka_min_insync_replicas | default(2) }}
+unclean.leader.election.enable=false
+auto.leader.rebalance.enable=true
+auto.create.topics.enable=false
+
+# Threading
+num.network.threads={{ kafka_num_network_threads | default(5) }}
+num.io.threads={{ kafka_num_io_threads | default(16) }}
+num.replica.fetchers={{ kafka_num_replica_fetchers | default(4) }}
+
+# Performance
+socket.send.buffer.bytes=102400
+socket.receive.buffer.bytes=102400
+socket.request.max.bytes=104857600
+log.retention.hours={{ kafka_log_retention_hours | default(168) }}
+log.segment.bytes=1073741824
+compression.type=lz4
+
+# TLS
+ssl.keystore.location=/opt/kafka/ssl/kafka.keystore.jks
+ssl.keystore.password={{ kafka_keystore_password }}
+ssl.key.password={{ kafka_key_password }}
+ssl.truststore.location=/opt/kafka/ssl/kafka.truststore.jks
+ssl.truststore.password={{ kafka_truststore_password }}
+ssl.client.auth=required
+ssl.endpoint.identification.algorithm=https
+
+# Metrics
+metric.reporters=org.apache.kafka.common.metrics.JmxReporter
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Ansible Vault for Secrets</h3>
+        <div class="diagram"><pre>
+# Encrypt sensitive vars file
+ansible-vault encrypt group_vars/kafka_brokers/vault.yml
+
+# vault.yml (encrypted at rest):
+vault_kafka_keystore_password: "s3cr3tK3yst0re"
+vault_kafka_key_password: "s3cr3tK3y"
+vault_kafka_truststore_password: "s3cr3tTrust"
+
+# group_vars/kafka_brokers/main.yml references vault vars:
+kafka_keystore_password: "{{ vault_kafka_keystore_password }}"
+
+# Run with vault password from file (CI uses this):
+ansible-playbook rolling_restart.yml \
+  --vault-password-file ~/.vault_pass \
+  -i inventory/production
+</pre></div>
+      </div>
+    </section>
+
+    <!-- Helm -->
+    <section id="helm">
+      <h2>Helm Charts for Kafka</h2>
+
+      <div class="concept-card">
+        <h3>Strimzi vs Bitnami Helm Chart</h3>
+        <table class="kv-table">
+          <thead><tr><th>Aspect</th><th>Strimzi Operator (via Helm)</th><th>Bitnami Kafka Helm Chart</th></tr></thead>
+          <tbody>
+            <tr><td>Approach</td><td>CRD-based operator pattern. Kafka cluster defined as <code>Kafka</code> CR.</td><td>Direct Helm values → StatefulSet, Services, ConfigMaps</td></tr>
+            <tr><td>Day-2 operations</td><td>Rolling upgrades, TLS rotation, user management via CRDs. Operator handles complexity.</td><td>Manual Helm upgrade. TLS management manual.</td></tr>
+            <tr><td>Production readiness</td><td>Better for long-term production (CNCF incubating project)</td><td>Good for quick setup, dev/staging</td></tr>
+            <tr><td>KRaft support</td><td>Yes, via <code>KafkaNodePool</code> CRD (Strimzi 0.35+)</td><td>Yes, via <code>kraft.enabled=true</code> in values</td></tr>
+            <tr><td>Schema Registry</td><td>Separate Strimzi Kafka Connect / or Confluent Operator</td><td>Not included; use separate Bitnami SR chart</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Strimzi Operator Deployment via Helm</h3>
+        <div class="diagram"><pre>
+# Add Strimzi Helm repo
+helm repo add strimzi https://strimzi.io/charts/
+helm repo update
+
+# Install Strimzi operator (watches all namespaces)
+helm install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
+  --namespace strimzi-system \
+  --create-namespace \
+  --set watchNamespaces="{kafka-prod,kafka-staging}" \
+  --set logLevel=INFO \
+  --set resources.requests.cpu=200m \
+  --set resources.requests.memory=256Mi \
+  --set resources.limits.cpu=1000m \
+  --set resources.limits.memory=512Mi
+
+# Verify operator is running
+kubectl get pods -n strimzi-system
+kubectl get crd | grep strimzi
+
+# Deploy Kafka cluster using CRD (not Helm values)
+kubectl apply -f kafka-cluster.yaml -n kafka-prod
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Bitnami Kafka — Production values.yaml</h3>
+        <div class="diagram"><pre>
+# values-production.yaml
+global:
+  storageClass: "gp3"
+
+replicaCount: 3
+
+kraft:
+  enabled: true
+
+controller:
+  replicaCount: 3
+  persistence:
+    size: 2Ti
+  resources:
+    requests:
+      cpu: 4
+      memory: 8Gi
+    limits:
+      cpu: 4
+      memory: 8Gi
+
+broker:
+  replicaCount: 6
+  persistence:
+    size: 2Ti
+  resources:
+    requests:
+      cpu: 8
+      memory: 16Gi
+    limits:
+      cpu: 8
+      memory: 16Gi
+
+extraConfig: |
+  auto.create.topics.enable=false
+  default.replication.factor=3
+  min.insync.replicas=2
+  unclean.leader.election.enable=false
+  num.io.threads=16
+  num.network.threads=5
+  compression.type=lz4
+  log.retention.hours=168
+
+auth:
+  clientProtocol: sasl
+  interBrokerProtocol: sasl
+  sasl:
+    mechanisms: scram-sha-512
+
+tls:
+  enabled: true
+  autoGenerated: false
+  existingSecret: kafka-tls-secret
+
+metrics:
+  kafka:
+    enabled: true
+  jmx:
+    enabled: true
+  serviceMonitor:
+    enabled: true         # Creates Prometheus ServiceMonitor
+    namespace: monitoring
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: kafka
+
+podDisruptionBudget:
+  create: true
+  maxUnavailable: 1
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Helm Release Management Best Practices</h3>
+        <ul class="checklist">
+          <li>Pin chart version in <code>Chart.yaml</code> dependencies — never use <code>*</code> or <code>latest</code></li>
+          <li>Store <code>values.yaml</code> per environment in Git; use <code>helm diff upgrade</code> (helm-diff plugin) before applying</li>
+          <li>Use <code>--atomic</code> flag in CI: rolls back automatically on timeout</li>
+          <li>Separate <code>values.yaml</code> for secrets overlay; pull from Vault via <code>helm secrets</code> plugin or ESO (External Secrets Operator)</li>
+          <li>Test upgrades in staging with production-equivalent config before promoting</li>
+          <li>Use <code>helm test</code> hook with a small producer/consumer pod to verify cluster health post-upgrade</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- GitOps -->
+    <section id="gitops">
+      <h2>GitOps with ArgoCD + Strimzi</h2>
+
+      <div class="concept-card">
+        <h3>GitOps Repository Structure</h3>
+        <div class="diagram"><pre>
+kafka-platform-gitops/
+├── apps/                             # ArgoCD Application CRDs
+│   ├── strimzi-operator.yaml
+│   ├── kafka-prod.yaml
+│   └── kafka-staging.yaml
+├── clusters/
+│   └── production/
+│       ├── kafka/
+│       │   ├── kafka-cluster.yaml    # Strimzi Kafka CR
+│       │   ├── kafka-node-pool.yaml  # KRaft node pools
+│       │   └── kafka-metrics-cm.yaml # JMX exporter config
+│       ├── topics/
+│       │   ├── payments.yaml         # KafkaTopic CRs
+│       │   ├── orders.yaml
+│       │   └── notifications.yaml
+│       ├── users/
+│       │   ├── payments-producer.yaml  # KafkaUser CRs
+│       │   └── analytics-consumer.yaml
+│       └── connect/
+│           ├── connect-cluster.yaml    # KafkaConnect CR
+│           └── debezium-connector.yaml # KafkaConnector CR
+└── base/                             # Kustomize base manifests
+    └── kafka/
+        ├── kustomization.yaml
+        └── ...
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>ArgoCD Application for Kafka</h3>
+        <div class="diagram"><pre>
+# apps/kafka-prod.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kafka-production
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: kafka-platform
+
+  source:
+    repoURL: https://github.com/hsbc/kafka-platform-gitops
+    targetRevision: main
+    path: clusters/production/kafka
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kafka-prod
+
+  syncPolicy:
+    automated:
+      prune: true          # Remove resources deleted from Git
+      selfHeal: true       # Revert manual kubectl changes
+      allowEmpty: false    # Never prune everything (safety)
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    - group: kafka.strimzi.io
+      kind: Kafka
+      jsonPointers:
+        - /status             # Strimzi writes to status, ignore
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data               # Managed by cert-manager/ESO
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>GitOps Workflow for Topic Changes</h3>
+        <div class="diagram">
+          <b>PR-based topic lifecycle</b>
+          <pre>
+Developer/SRE:
+  1. git checkout -b feature/add-audit-topic
+  2. Create clusters/production/topics/audit-events.yaml:
+       apiVersion: kafka.strimzi.io/v1beta2
+       kind: KafkaTopic
+       metadata:
+         name: audit.events.v1
+         labels:
+           strimzi.io/cluster: hsbc-kafka
+       spec:
+         partitions: 12
+         replicas: 3
+         config:
+           retention.ms: "2592000000"   # 30 days
+           min.insync.replicas: "2"
+           cleanup.policy: delete
+  3. git push origin feature/add-audit-topic
+  4. Open PR → automated checks run:
+       - yamllint (syntax)
+       - kubectl dry-run --server-side (admission validation)
+       - conftest/OPA policy checks (naming conventions,
+                    min replicas = 3, min.ISR = 2 required)
+  5. Peer review → approval → merge to main
+  6. ArgoCD detects change → syncs → Strimzi Topic Operator
+     creates/updates the topic on the cluster
+  7. Strimzi updates KafkaTopic.status.observedGeneration
+
+Audit trail: every topic change is a Git commit with author,
+timestamp, and PR review record.
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>OPA/Conftest Policies for Kafka CRDs</h3>
+        <div class="diagram"><pre>
+# policy/kafka_topic.rego
+package kafka.topic
+
+import future.keywords.if
+import future.keywords.in
+
+deny[msg] if {
+  input.kind == "KafkaTopic"
+  input.spec.replicas < 3
+  msg := sprintf("Topic '%s' must have replicas >= 3, got %d",
+                 [input.metadata.name, input.spec.replicas])
+}
+
+deny[msg] if {
+  input.kind == "KafkaTopic"
+  min_isr := to_number(input.spec.config["min.insync.replicas"])
+  min_isr < 2
+  msg := sprintf("Topic '%s' min.insync.replicas must be >= 2",
+                 [input.metadata.name])
+}
+
+deny[msg] if {
+  input.kind == "KafkaTopic"
+  not regex.match(`^[a-z][a-z0-9.-]{2,249}$`, input.metadata.name)
+  msg := sprintf("Topic name '%s' must match ^[a-z][a-z0-9.-]{2,249}$",
+                 [input.metadata.name])
+}
+
+warn[msg] if {
+  input.kind == "KafkaTopic"
+  not input.spec.config["retention.ms"]
+  msg := sprintf("Topic '%s' should have explicit retention.ms set",
+                 [input.metadata.name])
+}
+</pre></div>
+      </div>
+    </section>
+
+    <!-- CI/CD for Connectors -->
+    <section id="cicd">
+      <h2>CI/CD for Kafka Connectors</h2>
+
+      <div class="concept-card">
+        <h3>Connector Deployment Pipeline</h3>
+        <div class="diagram">
+          <b>GitHub Actions workflow for connector deployment</b>
+          <pre>
+Source repo structure:
+connectors/
+├── debezium-postgres/
+│   ├── connector-config.json.j2   # Jinja2 template
+│   ├── tests/
+│   │   └── integration_test.py
+│   └── Makefile
+└── s3-sink/
+    ├── connector-config.json.j2
+    └── tests/
+
+Pipeline stages:
+  1. Lint: jsonlint + custom schema validator on connector config
+  2. Unit test: mock Connect API, verify config merging logic
+  3. Deploy to staging:
+       - Render template: j2 connector-config.json.j2 > /tmp/config.json
+       - kubectl apply -f connector.yaml (Strimzi KafkaConnector CR)
+       - Wait for RUNNING state (poll /connectors/{name}/status)
+  4. Integration test (staging):
+       - Produce N records to source topic
+       - Verify N records appear in sink (S3, DB, etc.)
+       - Verify DLQ is empty
+  5. Approval gate (production): manual approval in GitHub Actions
+  6. Deploy to production (same steps as staging)
+  7. Smoke test: verify connector RUNNING, lag &lt; 100 after 5 min
+          </pre>
+        </div>
+
+        <div class="diagram"><pre>
+# .github/workflows/connector-deploy.yml
+name: Deploy Kafka Connector
+on:
+  push:
+    paths: ['connectors/**']
+    branches: [main]
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render connector config
+        run: |
+          pip install j2cli
+          j2 connectors/${{ env.CONNECTOR }}/connector-config.json.j2 \
+            -e STAGING_DB_HOST=${{ secrets.STAGING_DB_HOST }} \
+            > /tmp/connector-config.json
+
+      - name: Deploy to staging via Strimzi
+        run: |
+          kubectl apply -f - &lt;&lt;EOF
+          apiVersion: kafka.strimzi.io/v1beta2
+          kind: KafkaConnector
+          metadata:
+            name: debezium-payments
+            labels:
+              strimzi.io/cluster: kafka-connect-cluster
+          spec:
+            class: io.debezium.connector.postgresql.PostgresConnector
+            tasksMax: 4
+            config: $(cat /tmp/connector-config.json)
+          EOF
+
+      - name: Wait for connector RUNNING state
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(kubectl get kafkaconnector debezium-payments \
+              -o jsonpath='{.status.connectorStatus.connector.state}')
+            [ "$STATUS" = "RUNNING" ] && exit 0
+            sleep 10
+          done
+          echo "Connector failed to reach RUNNING state"
+          exit 1
+
+  deploy-production:
+    needs: deploy-staging
+    environment: production    # requires manual approval in GitHub
+    runs-on: ubuntu-latest
+    steps:
+      # Same steps as staging with production secrets
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Connector Config Template (Debezium)</h3>
+        <div class="diagram"><pre>
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "{{ TASKS_MAX | default('4') }}",
+  "database.hostname": "{{ DB_HOST }}",
+  "database.port": "{{ DB_PORT | default('5432') }}",
+  "database.user": "{{ DB_USER }}",
+  "database.password": "{{ DB_PASSWORD }}",
+  "database.dbname": "{{ DB_NAME }}",
+  "database.server.name": "{{ SERVER_NAME }}",
+  "plugin.name": "pgoutput",
+  "slot.name": "debezium_{{ SERVER_NAME }}_slot",
+  "publication.name": "debezium_pub",
+  "table.include.list": "{{ TABLE_INCLUDE_LIST }}",
+  "topic.prefix": "{{ TOPIC_PREFIX }}",
+  "key.converter": "io.confluent.kafka.serializers.KafkaAvroSerializer",
+  "key.converter.schema.registry.url": "{{ SCHEMA_REGISTRY_URL }}",
+  "value.converter": "io.confluent.kafka.serializers.KafkaAvroSerializer",
+  "value.converter.schema.registry.url": "{{ SCHEMA_REGISTRY_URL }}",
+  "errors.tolerance": "all",
+  "errors.deadletterqueue.topic.name": "{{ SERVER_NAME }}.dlq",
+  "errors.deadletterqueue.context.headers.enable": "true",
+  "decimal.handling.mode": "double",
+  "heartbeat.interval.ms": "10000",
+  "snapshot.mode": "initial"
+}
+</pre></div>
+      </div>
+    </section>
+
+    <!-- Topic as Code -->
+    <section id="topic-as-code">
+      <h2>Topic as Code</h2>
+
+      <div class="concept-card">
+        <h3>Topic Governance Model</h3>
+        <div class="diagram">
+          <b>Topic lifecycle via Git PR workflow</b>
+          <pre>
+Request → PR → Policy Check → Review → Merge → Auto-Apply
+
+Benefits:
+  ✓ Audit trail for every topic change (who, when, why)
+  ✓ Peer review prevents mistakes (wrong retention, RF=1)
+  ✓ Policy-as-code enforces standards (OPA/conftest)
+  ✓ Self-service for teams (no Kafka admin bottleneck)
+  ✓ Easy rollback (git revert PR)
+  ✓ Environment parity (staging/prod from same templates)
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Strimzi KafkaTopic CR (Topic as Code)</h3>
+        <div class="diagram"><pre>
+# topics/payments.transactions.v2.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: payments.transactions.v2
+  namespace: kafka-prod
+  labels:
+    strimzi.io/cluster: hsbc-kafka
+  annotations:
+    # Business metadata for governance
+    team: "payments-platform"
+    slack-channel: "#payments-sre"
+    data-classification: "PCI-DSS"
+    owner: "payments-team@hsbc.com"
+spec:
+  partitions: 24
+  replicas: 3
+  config:
+    cleanup.policy: "delete"
+    retention.ms: "604800000"        # 7 days
+    retention.bytes: "-1"
+    min.insync.replicas: "2"
+    compression.type: "lz4"
+    max.message.bytes: "1048576"     # 1 MB
+    segment.bytes: "1073741824"      # 1 GB
+    message.timestamp.type: "LogAppendTime"
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Terraform Topic Module for Self-Managed Kafka</h3>
+        <div class="diagram"><pre>
+# modules/kafka-topic/main.tf
+variable "name"               { type = string }
+variable "partitions"         { type = number }
+variable "replication_factor" { type = number; default = 3 }
+variable "min_insync_replicas"{ type = number; default = 2 }
+variable "retention_ms"       { type = number; default = 604800000 }
+variable "cleanup_policy"     { type = string; default = "delete" }
+variable "compression_type"   { type = string; default = "lz4" }
+
+resource "kafka_topic" "this" {
+  name               = var.name
+  replication_factor = var.replication_factor
+  partitions         = var.partitions
+
+  config = {
+    "cleanup.policy"          = var.cleanup_policy
+    "retention.ms"            = tostring(var.retention_ms)
+    "min.insync.replicas"     = tostring(var.min_insync_replicas)
+    "compression.type"        = var.compression_type
+  }
+
+  lifecycle {
+    prevent_destroy = true    # Require explicit plan to delete
+  }
+}
+
+# Usage in environment config:
+module "payments_topic" {
+  source             = "../../modules/kafka-topic"
+  name               = "payments.transactions.v2"
+  partitions         = 24
+  replication_factor = 3
+  min_insync_replicas = 2
+  retention_ms       = 604800000
+}
+</pre></div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Automated Partition Scaling</h3>
+        <div class="callout warn">
+          <strong>Partitions can only be increased, never decreased.</strong> Over-partitioning is worse than under-partitioning. Start with a formula and review regularly.
+        </div>
+        <div class="diagram"><pre>
+Partition Sizing Formula:
+  target_rate = max(producer_rate, consumer_rate)  # msg/sec
+  target_partitions = ceil(target_rate / throughput_per_partition)
+  throughput_per_partition ≈ 10 MB/s (NVMe) or 5 MB/s (spinning disk)
+
+Example:
+  producer_rate = 500 MB/s
+  throughput_per_partition = 10 MB/s (NVMe SSDs)
+  partitions = ceil(500/10) = 50 → round to 48 (multiple of consumers)
+
+Automation (KEDA-based or custom):
+  - Monitor bytes-in-rate per partition via Prometheus
+  - If avg > 8 MB/s per partition for 10 consecutive minutes:
+      → Open automated PR to increase partitions by 50%
+      → Require human approval (increasing partitions is irreversible)
+  - Never auto-apply partition changes — require PR approval
+</pre></div>
+      </div>
+    </section>
+
+    <!-- Q&A -->
+    <section id="qa">
+      <h2>Q &amp; A</h2>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-senior">Senior</span> How would you manage Kafka topic configuration drift between staging and production?</div>
+        <div class="qa-a">
+          <p><strong>The root cause of drift</strong> is usually out-of-band changes: someone runs <code>kafka-configs.sh --alter</code> directly on prod for an emergency and forgets to update the code. Preventing this requires making the "right path" (Git PR) easier than the "wrong path" (direct kubectl/kafka-configs).</p>
+
+          <p><strong>My approach:</strong></p>
+          <ol>
+            <li><strong>Single source of truth in Git:</strong> All topic configs in YAML (Strimzi KafkaTopic CRs) in a GitOps repo. ArgoCD's <code>selfHeal=true</code> automatically reverts any out-of-band change within minutes.</li>
+            <li><strong>Drift detection job:</strong> Scheduled CronJob in CI (daily) that runs <code>kafka-topics.sh --describe</code> for all topics and compares against expected values from Git. Posts diff to Slack if drift found.</li>
+            <li><strong>Config validation in PR:</strong> OPA/conftest policies check that staging and prod configs have the same replication factor, min.ISR, and cleanup policy. Retention may differ (staging = 1 day, prod = 7 days) — this is intentional and encoded in variables.</li>
+            <li><strong>Access controls:</strong> RBAC on Kubernetes means only the Strimzi operator ServiceAccount has permission to modify topics. Engineers don't get direct <code>kafka-admin</code> access in production — they must go through Git.</li>
+          </ol>
+          <p>This makes drift structurally impossible for most config changes, and detectable within hours for emergency overrides.</p>
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-senior">Senior</span> Describe how you'd implement zero-touch Kafka cluster upgrades using GitOps.</div>
+        <div class="qa-a">
+          <p>Kafka upgrades have two phases: the binary version bump, then the <code>inter.broker.protocol.version</code> (IBP) bump. These must be separate steps because rolling back the binary is possible; rolling back IBP is not.</p>
+
+          <p><strong>GitOps workflow:</strong></p>
+          <ol>
+            <li>Engineer opens PR updating the Strimzi Kafka CR: <code>spec.kafka.version: 3.6.0 → 3.7.0</code>. The IBP field is intentionally left at <code>3.6</code>.</li>
+            <li>CI runs: yamllint, schema validation, <code>kubectl diff --server-side</code> shows the diff. Required reviewer approves.</li>
+            <li>Merge to staging branch → ArgoCD syncs staging → Strimzi operator performs rolling restart one broker at a time, gating on <code>UnderReplicatedPartitions=0</code> before each broker. CI runs integration tests post-upgrade.</li>
+            <li>After 48-hour soak in staging: promote to main → ArgoCD syncs production with the same binary version change.</li>
+            <li>Second PR: bump <code>inter.broker.protocol.version: "3.7"</code> and <code>log.message.format.version: "3.7"</code>. Same PR → review → staging → production flow. This is the point of no return.</li>
+          </ol>
+          <p><strong>Strimzi does the hard work:</strong> It validates cluster health before each broker restart, waits for ISR recovery, and handles the IBP bump sequentially. The SRE's job is the PR review — the automation handles execution.</p>
+          <p><strong>Rollback gate:</strong> If integration tests fail in staging after the binary bump (before IBP), revert the PR. Strimzi will roll back the binary version on next sync. After IBP bump, rollback is impossible — this is why the soak period and two-PR approach matter.</p>
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-mid">Mid</span> What's the difference between managing Kafka on MSK vs Confluent Cloud vs self-managed with Strimzi from an IaC perspective?</div>
+        <div class="qa-a">
+          <table class="kv-table">
+            <thead><tr><th>Aspect</th><th>MSK</th><th>Confluent Cloud</th><th>Strimzi (K8s)</th></tr></thead>
+            <tbody>
+              <tr><td>Terraform provider</td><td><code>hashicorp/aws</code></td><td><code>confluentinc/confluent</code></td><td><code>hashicorp/kubernetes</code> + raw YAML</td></tr>
+              <tr><td>What you manage</td><td>Cluster, config, storage. AWS handles broker OS, ZK.</td><td>Very little — cluster size (CKU), topics, ACLs, connectors</td><td>Everything: cluster, config, upgrades, TLS, storage, networking</td></tr>
+              <tr><td>Topic management</td><td>Via Kafka provider (<code>Mongey/kafka</code>) or MSK serverless Terraform</td><td>Via <code>confluent_kafka_topic</code> resource</td><td>Strimzi KafkaTopic CR via GitOps</td></tr>
+              <tr><td>Secrets</td><td>IAM roles or Secrets Manager for SCRAM</td><td>API keys via Terraform (use Vault to store)</td><td>Kubernetes Secrets (cert-manager for TLS, ESO for credentials)</td></tr>
+              <tr><td>Operational burden</td><td>Medium (AWS manages hardware)</td><td>Low (fully managed)</td><td>High (you manage everything)</td></tr>
+              <tr><td>Control</td><td>Medium</td><td>Low (Confluent constraints)</td><td>Full</td></tr>
+            </tbody>
+          </table>
+          <p>For HSBC (regulated financial services), Strimzi on-prem or private cloud gives the control and data residency guarantees needed. MSK is a good middle ground for AWS-native workloads. Confluent Cloud for the lowest-risk use cases where data residency constraints permit.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+</body>
+</html>

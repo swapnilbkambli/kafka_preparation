@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka REST Proxy — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🌐 Kafka REST Proxy</h1>
+  <div class="header-right"><span class="pill pill-purple">Ecosystem</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#what-is">What &amp; Why</a>
+  <a href="#produce">Producing via REST</a>
+  <a href="#consume">Consuming via REST</a>
+  <a href="#formats">Data Formats</a>
+  <a href="#admin">Admin Operations</a>
+  <a href="#security">Security</a>
+  <a href="#limitations">Limitations &amp; Trade-offs</a>
+  <a href="#qa">Concepts &amp; Scenario Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- What & Why -->
+<div class="section" id="what-is">
+  <div class="section-header"><span class="section-icon">🌐</span><span class="section-title">What is Kafka REST Proxy &amp; Why Use It?</span></div>
+
+  <div class="diagram">  KAFKA REST PROXY ARCHITECTURE:
+  ──────────────────────────────────────────────────────────────────
+
+  HTTP Clients                REST Proxy                  Kafka
+  ─────────────               ─────────────               ─────
+  Python script   ──POST──►  ┌─────────────┐  produce ►  Topic A
+  IoT device      ──POST──►  │  Confluent  │             Topic B
+  Bash / curl     ──GET──►   │  REST Proxy │  consume ◄  Topic C
+  Legacy system   ──HTTP──►  │  (:8082)    │  metadata   Cluster
+  Mobile app      ──HTTP──►  └─────────────┘
+                             │  Translates │
+                             │  HTTP ↔     │
+                             │  Kafka Proto│
+                             └─────────────┘
+                             Stateful: holds consumer
+                             connections per consumer
+                             instance ID</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Primary Use Case</h4>
+      <p>Allows clients that cannot use the Kafka binary protocol (non-JVM, IoT, legacy systems, scripting) to produce and consume Kafka messages via standard HTTP. No Kafka client library required — just HTTP.</p>
+    </div>
+    <div class="concept-card">
+      <h4>What It Is NOT</h4>
+      <p>Not a replacement for native Kafka clients in performance-sensitive paths. Not a streaming interface — HTTP is request/response, not streaming. Not suitable for high-throughput producers (latency overhead per HTTP request).</p>
+    </div>
+    <div class="concept-card">
+      <h4>Stateful Consumer Sessions</h4>
+      <p>Unlike the native client, REST Proxy maintains consumer state server-side. A consumer instance is created (POST /consumers), then repeatedly polls (GET /records). The proxy holds the Kafka consumer object — requests must route to the same proxy instance.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Schema Registry Integration</h4>
+      <p>REST Proxy integrates with Schema Registry. Set <code>Content-Type: application/vnd.kafka.avro.v2+json</code> and REST Proxy serializes/deserializes Avro automatically, looking up schemas from SR.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Producing -->
+<div class="section" id="produce">
+  <div class="section-header"><span class="section-icon">📤</span><span class="section-title">Producing Messages via REST</span></div>
+
+  <div class="diagram">  # Produce JSON messages to a topic
+  POST /topics/payments
+  Content-Type: application/vnd.kafka.json.v2+json
+  {
+    "records": [
+      {"key": "acc-001", "value": {"amount": 150.00, "currency": "USD"}},
+      {"key": "acc-002", "value": {"amount": 75.50, "currency": "GBP"}}
+    ]
+  }
+
+  Response 200:
+  {
+    "key_schema_id": null,
+    "value_schema_id": null,
+    "offsets": [
+      {"partition": 3, "offset": 10004, "error": null},
+      {"partition": 1, "offset": 20301, "error": null}
+    ]
+  }
+
+  # Produce Avro with Schema Registry
+  POST /topics/payments
+  Content-Type: application/vnd.kafka.avro.v2+json
+  {
+    "value_schema": "{\"type\":\"record\",\"name\":\"Payment\",\"fields\":[...]}",
+    "records": [
+      {"value": {"id": "PAY-001", "amount": 100.0}}
+    ]
+  }
+
+  # Produce to a specific partition
+  POST /topics/payments/partitions/2
+  {
+    "records": [{"value": {"amount": 200.0}}]
+  }</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Performance caveat:</strong> Each POST /topics call goes through HTTP parsing, JSON serialization, and a synchronous Kafka produce call. Throughput is orders of magnitude lower than native Kafka producers. For bulk ingestion, batch multiple records in one POST (up to the configured max batch size), but still — don't use REST Proxy for high-throughput paths. Use it for low-frequency, convenience-driven producers.</div>
+  </div>
+</div>
+
+<!-- Consuming -->
+<div class="section" id="consume">
+  <div class="section-header"><span class="section-icon">📥</span><span class="section-title">Consuming Messages via REST</span></div>
+
+  <div class="diagram">  CONSUMER LIFECYCLE (3 steps, must use same proxy instance):
+  ──────────────────────────────────────────────────────────────────
+
+  Step 1: Create consumer instance (initializes Kafka consumer)
+  POST /consumers/my-consumer-group
+  Content-Type: application/vnd.kafka.v2+json
+  {"name": "my-instance", "format": "json", "auto.offset.reset": "earliest"}
+
+  Response: {"instance_id": "my-instance",
+             "base_uri": "http://proxy-1:8082/consumers/my-consumer-group/instances/my-instance"}
+
+  Step 2: Subscribe to topic(s)
+  POST /consumers/my-consumer-group/instances/my-instance/subscription
+  {"topics": ["payments"]}
+
+  Step 3: Poll for records (call repeatedly)
+  GET /consumers/my-consumer-group/instances/my-instance/records
+  Accept: application/vnd.kafka.json.v2+json
+  Response:
+  [
+    {"topic": "payments", "partition": 3, "offset": 10004,
+     "key": "acc-001", "value": {"amount": 150.00}},
+    ...
+  ]
+
+  Step 4: Commit offsets (manual commit)
+  POST /consumers/my-consumer-group/instances/my-instance/offsets
+  {"offsets": [{"topic": "payments", "partition": 3, "offset": 10005}]}
+
+  Step 5: Delete consumer instance when done
+  DELETE /consumers/my-consumer-group/instances/my-instance</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Sticky routing requirement:</strong> After Step 1, the consumer instance lives on a specific proxy server. All subsequent calls (subscribe, poll, commit, delete) MUST go to the same proxy instance. Use sticky sessions on your load balancer (cookie-based or consistent hashing on instance ID). Calling a different proxy server returns 404 — the instance doesn't exist there.</div>
+  </div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Consumer leak:</strong> If a client creates a consumer instance (Step 1) but never deletes it (Step 5) — even after the HTTP connection drops — the consumer instance remains active on the proxy server, holding a Kafka consumer connection. This causes partition assignment issues and eventually exhausts proxy resources. Always DELETE the consumer instance when done, even on error. Set <code>consumer.instance.timeout.ms</code> on the proxy to auto-expire idle instances.</div>
+  </div>
+</div>
+
+<!-- Formats -->
+<div class="section" id="formats">
+  <div class="section-header"><span class="section-icon">📄</span><span class="section-title">Data Formats</span></div>
+
+  <table class="kv-table">
+    <tr><th>Content-Type</th><th>Format</th><th>Schema Registry?</th><th>Notes</th></tr>
+    <tr><td><code>application/vnd.kafka.binary.v2+json</code></td><td>Base64-encoded bytes</td><td>No</td><td>Raw bytes, client handles serialization. Flexible but verbose.</td></tr>
+    <tr><td><code>application/vnd.kafka.json.v2+json</code></td><td>JSON objects</td><td>No</td><td>Most common for simple use cases. Schema not enforced.</td></tr>
+    <tr><td><code>application/vnd.kafka.avro.v2+json</code></td><td>Avro + JSON wrapper</td><td>Yes</td><td>Proxy handles Avro serialization. Schema registered/looked up via SR. Best for schema governance.</td></tr>
+    <tr><td><code>application/vnd.kafka.jsonschema.v2+json</code></td><td>JSON Schema</td><td>Yes</td><td>JSON with schema validation via SR.</td></tr>
+    <tr><td><code>application/vnd.kafka.protobuf.v2+json</code></td><td>Protobuf + JSON</td><td>Yes</td><td>Protobuf payload with SR registration. Less common.</td></tr>
+  </table>
+</div>
+
+<!-- Admin -->
+<div class="section" id="admin">
+  <div class="section-header"><span class="section-icon">⚙️</span><span class="section-title">Admin Operations via REST Proxy</span></div>
+
+  <div class="diagram">  # List topics
+  GET /topics
+  Response: ["payments", "orders", "fraud-alerts", ...]
+
+  # Get topic metadata (partitions, replication, configs)
+  GET /topics/payments
+  Response: {"name":"payments","configs":{"cleanup.policy":"delete",...},
+             "partitions":[{"partition":0,"leader":1,"replicas":[...],"isr":[...]},...]}
+
+  # Get partition metadata
+  GET /topics/payments/partitions
+  GET /topics/payments/partitions/0
+
+  # Get broker list
+  GET /brokers
+  Response: {"brokers": [1, 2, 3]}
+
+  NOTE: REST Proxy admin APIs are READ-ONLY (metadata only).
+  For write operations (create topic, alter configs, reassign partitions)
+  use kafka-topics.sh, kafka-configs.sh, or Kafka Admin Client API directly.</div>
+</div>
+
+<!-- Security -->
+<div class="section" id="security">
+  <div class="section-header"><span class="section-icon">🔐</span><span class="section-title">Security</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Proxy → Kafka Auth</h4>
+      <p>REST Proxy authenticates to Kafka as a client. Configure <code>client.security.protocol</code>, <code>client.ssl.*</code>, or <code>client.sasl.*</code> properties in the proxy config. The proxy acts as a privileged Kafka client on behalf of HTTP callers.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Client → Proxy Auth</h4>
+      <p>HTTP clients auth to the proxy using HTTP Basic Auth or API keys (depending on deployment). Add a reverse proxy (nginx, Kong) for auth enforcement. REST Proxy itself has limited built-in auth — secure it at the network/gateway level.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Per-Client ACLs</h4>
+      <p>In the community version, the proxy uses a single Kafka identity for all HTTP clients — ACLs apply to the proxy's service account, not per HTTP client. Confluent Platform's REST Proxy supports per-client auth propagation for granular ACLs.</p>
+    </div>
+    <div class="concept-card">
+      <h4>TLS</h4>
+      <p>Enable TLS on the REST Proxy HTTP listener (<code>listeners.https.*</code>). Use valid certificates. REST Proxy → Kafka communication should also be TLS (<code>client.ssl.truststore.*</code>).</p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Security gap:</strong> Without per-client auth propagation, any HTTP client reaching the REST Proxy endpoint can produce/consume any topic the proxy's service account has access to. This is a significant security risk in multi-tenant environments. Either use Confluent Platform's per-client auth, or run separate REST Proxy instances per team/application with different Kafka service accounts.</div>
+  </div>
+</div>
+
+<!-- Limitations -->
+<div class="section" id="limitations">
+  <div class="section-header"><span class="section-icon">⚠️</span><span class="section-title">Limitations &amp; Trade-offs</span></div>
+
+  <table class="kv-table">
+    <tr><th>Limitation</th><th>Impact</th><th>Mitigation</th></tr>
+    <tr><td>Stateful consumer sessions</td><td>Must use sticky routing to same proxy instance. Load balancing complexity.</td><td>Sticky sessions on LB; or use consumer group per proxy instance pattern.</td></tr>
+    <tr><td>No long-polling efficiency</td><td>HTTP is request-response; poll loop adds latency vs native consumer</td><td>Short poll intervals; accept higher latency as a trade-off for simplicity</td></tr>
+    <tr><td>Throughput ceiling</td><td>HTTP overhead limits to ~10K msg/s per proxy vs millions/s native</td><td>Use native client for high-throughput paths</td></tr>
+    <tr><td>Limited exactly-once</td><td>No transactional produce via REST API</td><td>Design for idempotent sinks; accept at-least-once</td></tr>
+    <tr><td>No stream (WebSocket)</td><td>Must poll repeatedly; can't push new records to client</td><td>Use Server-Sent Events (SSE) or WebSocket bridge if streaming needed</td></tr>
+    <tr><td>Single Kafka identity</td><td>All HTTP clients use same Kafka ACL context (community version)</td><td>Confluent Platform for per-client ACLs, or separate proxy instances</td></tr>
+  </table>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Concepts &amp; Scenario Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        An HTTP client is getting 404 errors when trying to poll records, even though it created a consumer instance successfully. What's wrong?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Classic <strong>sticky session routing failure</strong>. The consumer instance was created on REST Proxy instance A. The subsequent poll request was routed to REST Proxy instance B (by the load balancer) — which has no record of this consumer instance.
+        <br><br>
+        <strong>Fix:</strong>
+        <ul>
+          <li>Configure the load balancer for <strong>sticky sessions</strong> based on the consumer instance base_uri or a cookie. Route all requests for the same consumer instance to the same proxy backend.</li>
+          <li>Alternatively: assign each consumer application to a specific proxy instance (bypass LB for consumer sessions).</li>
+          <li>Also check: did the consumer instance expire? If the client didn't poll within <code>consumer.instance.timeout.ms</code> (default 300s), the proxy auto-deletes the instance.</li>
+        </ul>
+        <strong>Prevention:</strong> Design client code to handle 404 on poll by re-creating the consumer instance and re-subscribing. This makes the client resilient to proxy restarts and expiry.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Why would you choose REST Proxy over a native Kafka client? What are the trade-offs?
+        <span class="difficulty d-basic">Basic</span></div>
+      <div class="qa-a">
+        <strong>Choose REST Proxy when:</strong>
+        <ul>
+          <li>The producer/consumer is written in a language without a mature Kafka client (some niche languages, old legacy systems).</li>
+          <li>Firewall/security policy only allows HTTP/HTTPS — Kafka port 9092 is blocked.</li>
+          <li>You need a quick proof-of-concept without implementing Kafka client setup.</li>
+          <li>IoT devices or embedded systems that can only do HTTP.</li>
+        </ul>
+        <strong>Trade-offs:</strong>
+        <ul>
+          <li>Lower throughput (HTTP overhead, synchronous per-batch)</li>
+          <li>Higher latency (extra network hop through proxy)</li>
+          <li>Stateful consumer sessions complicate load balancing</li>
+          <li>Limited delivery semantics (no transactions, no idempotent producer equivalent)</li>
+          <li>Additional infrastructure to operate and scale</li>
+        </ul>
+        <strong>In a bank context:</strong> REST Proxy is valuable for integrating with legacy batch systems that can only speak HTTP/SOAP. For all new services, native Kafka clients (Java, Python kafka-python, Go sarama) are strongly preferred.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

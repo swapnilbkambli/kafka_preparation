@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ksqlDB — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>⚡ ksqlDB</h1>
+  <div class="header-right"><span class="pill pill-purple">Ecosystem</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#what-is">Architecture</a>
+  <a href="#streams-tables">Streams vs Tables</a>
+  <a href="#queries">Query Types</a>
+  <a href="#windowing">Windowing</a>
+  <a href="#joins">Joins</a>
+  <a href="#state">State Stores</a>
+  <a href="#deployment">Deployment Modes</a>
+  <a href="#udfs">UDFs &amp; UDAFs</a>
+  <a href="#qa">Concepts &amp; Scenario Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Architecture -->
+<div class="section" id="what-is">
+  <div class="section-header"><span class="section-icon">⚡</span><span class="section-title">ksqlDB Architecture</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">ksqlDB is a streaming SQL engine built on top of Kafka Streams. It exposes SQL semantics for stream processing — no Java/Scala code required. Under the hood every ksqlDB query compiles to a Kafka Streams topology.</p>
+
+  <div class="diagram">  KSQLDB ARCHITECTURE:
+  ──────────────────────────────────────────────────────────────────
+
+  Client (CLI / REST)
+       │ SQL statement
+       ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │             ksqlDB Server (headless or interactive)          │
+  │                                                              │
+  │  ┌──────────────┐   ┌─────────────────────────────────────┐ │
+  │  │  REST API    │   │  Query Execution Engine             │ │
+  │  │  (:8088)     │──►│  SQL Parser → Logical Plan          │ │
+  │  └──────────────┘   │  → Physical Plan → KStreams Topology│ │
+  │                     └──────────────┬────────────────────── ┘ │
+  │                                    │                          │
+  │  ┌─────────────────────────────────▼──────────────────────┐  │
+  │  │  Kafka Streams Layer                                    │  │
+  │  │  - KStream / KTable / GlobalKTable                      │  │
+  │  │  - State Stores (RocksDB) per partition                 │  │
+  │  │  - Changelog topics for fault tolerance                  │  │
+  │  └──────────────────────────────┬─────────────────────────┘  │
+  └─────────────────────────────────┼──────────────────────────── ┘
+                                    │ consume/produce
+                                    ▼
+                           Apache Kafka Cluster
+
+  CLUSTER MODE: Multiple ksqlDB servers form a cluster.
+  Queries are distributed across servers (partitions assigned via
+  consumer group). Any server can accept queries — internal
+  routing forwards to correct partition owner for pull queries.</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Persistent Query</h4>
+      <p>Runs continuously until explicitly terminated. Creates a Kafka Streams application under the hood. Results are materialized to a Kafka topic (CREATE STREAM AS SELECT or CREATE TABLE AS SELECT). Survives server restarts.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Transient (Ad-hoc) Query</h4>
+      <p>Runs only for the duration of the client connection (SELECT ... EMIT CHANGES). Used for interactive exploration. Terminates when client disconnects. Does not persist results to a topic.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Internal Topics</h4>
+      <p>ksqlDB creates internal Kafka topics for: query state changelog, repartitioning (when joining on non-partition keys), and aggregation results. These are prefixed with the application ID and should not be manually deleted.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Schema Integration</h4>
+      <p>ksqlDB integrates with Schema Registry. When creating a stream/table, specify <code>VALUE_FORMAT='AVRO'</code> and ksqlDB auto-discovers the schema. Schema evolution in SR is reflected in ksqlDB queries automatically.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Streams vs Tables -->
+<div class="section" id="streams-tables">
+  <div class="section-header"><span class="section-icon">🌊</span><span class="section-title">Streams vs Tables</span></div>
+
+  <div class="diagram">  STREAM vs TABLE DUALITY:
+  ──────────────────────────────────────────────────────────────────
+
+  STREAM (unbounded, append-only event log):
+  Offset: 0        1        2        3        4
+  Key:    user-1   user-2   user-1   user-3   user-1
+  Event:  login    login    purchase logout   logout
+  → Every event is a fact. No "latest state" concept.
+  → CREATE STREAM clicks (user_id VARCHAR KEY, url VARCHAR)
+      WITH (kafka_topic='clickstream', value_format='AVRO');
+
+  TABLE (materialized view — latest value per key):
+  Key:    user-1          user-2          user-3
+  Value:  {balance:450}  {balance:200}  {balance:800}
+  → Only the latest record per key is meaningful. Upsert semantics.
+  → null value = tombstone (delete the key)
+  → CREATE TABLE account_balance (account_id VARCHAR PRIMARY KEY, balance DOUBLE)
+      WITH (kafka_topic='balances', value_format='AVRO');
+
+  TABLE TYPES:
+  KTable          → partitioned, one partition per query thread
+  GlobalKTable    → full copy on every server (for broadcast joins)</div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>Stream</th><th>Table</th></tr>
+    <tr><td>Represents</td><td>Immutable event log</td><td>Mutable state (latest per key)</td></tr>
+    <tr><td>Semantic</td><td>Append-only (every record matters)</td><td>Upsert (latest value per key)</td></tr>
+    <tr><td>State store</td><td>No (unless windowed aggregation)</td><td>Yes (RocksDB per partition)</td></tr>
+    <tr><td>Pull query support</td><td>No</td><td>Yes (point-in-time state lookup)</td></tr>
+    <tr><td>Null value</td><td>Valid event with null payload</td><td>Tombstone — deletes the key</td></tr>
+    <tr><td>Backed by</td><td>Kafka topic (any)</td><td>Kafka topic (compacted recommended)</td></tr>
+  </table>
+</div>
+
+<!-- Query Types -->
+<div class="section" id="queries">
+  <div class="section-header"><span class="section-icon">🔍</span><span class="section-title">Push vs Pull Queries</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Push Query (EMIT CHANGES)</h4>
+      <p>Subscribes to a continuous stream of results as new data arrives. Like a streaming SELECT. Keeps connection open. Used for: real-time dashboards, alerting, event-driven microservices.<br><code>SELECT * FROM orders EMIT CHANGES;</code></p>
+    </div>
+    <div class="concept-card">
+      <h4>Pull Query (point-in-time)</h4>
+      <p>Returns current state of a materialized table at the moment of the query. Like a traditional DB SELECT — returns immediately. Only works on tables with state stores (aggregations, joins). <br><code>SELECT balance FROM account_balance WHERE account_id = 'ACC001';</code></p>
+    </div>
+    <div class="concept-card">
+      <h4>CREATE STREAM AS SELECT</h4>
+      <p>Persistent transformation query. Creates a new stream (Kafka topic) populated by the result of transforming/filtering another stream. Runs forever as a Kafka Streams app.<br><code>CREATE STREAM high_value_orders AS SELECT * FROM orders WHERE amount &gt; 10000 EMIT CHANGES;</code></p>
+    </div>
+    <div class="concept-card">
+      <h4>CREATE TABLE AS SELECT</h4>
+      <p>Persistent aggregation query. Creates a new table (materialized view) by aggregating a stream. E.g., running count of orders per customer. The table is continuously updated as new events arrive.<br><code>CREATE TABLE order_counts AS SELECT customer_id, COUNT(*) AS cnt FROM orders GROUP BY customer_id EMIT CHANGES;</code></p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Pull query routing in clustered mode:</strong> In a multi-server ksqlDB cluster, state is partitioned across servers. A pull query for key "ACC001" is routed to the server that owns that partition. This is transparent to the client — any server accepts the query and internally routes it. This requires servers to know each other's addresses via <code>ksql.advertised.listener</code>.</div>
+  </div>
+</div>
+
+<!-- Windowing -->
+<div class="section" id="windowing">
+  <div class="section-header"><span class="section-icon">🕐</span><span class="section-title">Windowing</span></div>
+
+  <div class="diagram">  WINDOW TYPES:
+  ──────────────────────────────────────────────────────────────────
+
+  TUMBLING WINDOW (fixed, non-overlapping):
+  |──────10min──────|──────10min──────|──────10min──────|
+  Window 1: 09:00-09:10   Window 2: 09:10-09:20   ...
+  → Each event belongs to exactly ONE window
+  → Use: hourly metrics, daily summaries
+  SELECT account_id, SUM(amount) FROM payments
+    WINDOW TUMBLING (SIZE 1 HOUR)
+    GROUP BY account_id EMIT CHANGES;
+
+  HOPPING WINDOW (fixed size, sliding step — OVERLAPPING):
+  |─────1hr──────|
+       |─────1hr──────|
+            |─────1hr──────|
+  → step = 15min, size = 1hr → each event in 4 windows
+  → Use: rolling averages, moving sums
+  WINDOW HOPPING (SIZE 1 HOUR, ADVANCE BY 15 MINUTES)
+
+  SESSION WINDOW (event-driven, variable size):
+  Events: ──●─●──────────────────●─●─●───── ...
+  Gap:       inactivity gap (30min) → new session
+  → Window size varies. Gaps between events define boundaries.
+  → Use: user sessions, activity bursts
+  WINDOW SESSION (30 MINUTES)
+
+  LATE EVENTS:
+  ksqlDB handles late-arriving events via GRACE PERIOD:
+  WINDOW TUMBLING (SIZE 1 HOUR) GRACE PERIOD 30 MINUTES;
+  → Events up to 30min late are included in their window.
+  → After grace period, window is finalized.</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Window results are NOT final until grace period expires.</strong> A tumbling window for 09:00-10:00 with a 30-minute grace period won't finalize until 10:30. Pull queries on windowed tables may return incomplete counts for active windows. Design dashboards to show "current window is in-progress" appropriately.</div>
+  </div>
+</div>
+
+<!-- Joins -->
+<div class="section" id="joins">
+  <div class="section-header"><span class="section-icon">🔗</span><span class="section-title">Joins in ksqlDB</span></div>
+
+  <table class="kv-table">
+    <tr><th>Join Type</th><th>Left</th><th>Right</th><th>Semantics</th><th>Key Requirement</th></tr>
+    <tr><td>Stream-Stream</td><td>Stream</td><td>Stream</td><td>Joins events within a time window. Both sides must be co-partitioned. Result is a stream.</td><td>Same key, same partition count</td></tr>
+    <tr><td>Stream-Table</td><td>Stream</td><td>Table</td><td>Each stream event is enriched by looking up the latest table value for the matching key. Real-time enrichment pattern.</td><td>Stream key = Table key</td></tr>
+    <tr><td>Stream-GlobalKTable</td><td>Stream</td><td>GlobalKTable</td><td>Same as Stream-Table but GlobalKTable is replicated to ALL servers — no co-partitioning requirement. Better for small lookup tables.</td><td>No co-partitioning needed</td></tr>
+    <tr><td>Table-Table</td><td>Table</td><td>Table</td><td>Produces a new table: merged view of both tables joined on key. Updates when either side changes.</td><td>Same key, same partition count</td></tr>
+  </table>
+
+  <div class="diagram">  STREAM-TABLE JOIN (enrichment pattern):
+  ──────────────────────────────────────────────────────────────────
+  Stream: payments (payment_id, account_id, amount)
+  Table:  accounts  (account_id PRIMARY KEY, customer_name, tier)
+
+  Goal: Enrich each payment with customer name and tier
+
+  CREATE STREAM enriched_payments AS
+    SELECT p.payment_id, p.amount, a.customer_name, a.tier
+    FROM payments p
+    LEFT JOIN accounts a ON p.account_id = a.account_id
+    EMIT CHANGES;
+
+  When payment arrives for account_id='ACC001':
+  → ksqlDB looks up current Table state for 'ACC001'
+  → If found: produces enriched record to output stream
+  → If not found (LEFT JOIN): produces record with null account fields
+
+  STREAM-STREAM JOIN (windowed):
+  ──────────────────────────────────────────────────────────────────
+  -- Detect payment events that also have a fraud alert within 5 min
+  CREATE STREAM suspicious_payments AS
+    SELECT p.payment_id, f.alert_type
+    FROM payments p
+    JOIN fraud_alerts f WITHIN 5 MINUTES GRACE PERIOD 1 MINUTE
+    ON p.account_id = f.account_id
+    EMIT CHANGES;</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Co-partitioning requirement:</strong> Stream-Stream and Stream-Table joins require both sides to have the same number of partitions and the same partition key. If not, ksqlDB automatically creates a repartition topic — adds latency and internal topic overhead. Design your topics with joins in mind, or use GlobalKTable to bypass this requirement for small dimension tables.</div>
+  </div>
+</div>
+
+<!-- State Stores -->
+<div class="section" id="state">
+  <div class="section-header"><span class="section-icon">💾</span><span class="section-title">State Stores</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>RocksDB State Store</h4>
+      <p>ksqlDB uses RocksDB (embedded key-value store) for local state storage — aggregation results, join lookups, windowed state. Stored on local disk of the ksqlDB server. Fast for sequential access. Partitioned: each server owns state for a subset of keys.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Changelog Topic</h4>
+      <p>Every state store has a backing Kafka changelog topic. Stores every state update. On server restart, state is restored by replaying the changelog. This enables fault tolerance — state is not lost when a server crashes.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Standby Replicas</h4>
+      <p>ksqlDB servers can maintain standby state replicas for faster failover. Configure <code>ksql.streams.num.standby.replicas</code>. Standbys continuously consume the changelog — on failover, they take over immediately without full state rebuild.</p>
+    </div>
+    <div class="concept-card">
+      <h4>State Store Size</h4>
+      <p>Monitor disk usage on ksqlDB servers — state stores can grow very large for high-cardinality aggregations or long retention windows. Set <code>retention.ms</code> on windowed state or use the <code>GRACE PERIOD</code> clause to bound state retention.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Deployment -->
+<div class="section" id="deployment">
+  <div class="section-header"><span class="section-icon">🚀</span><span class="section-title">Deployment Modes</span></div>
+
+  <table class="kv-table">
+    <tr><th>Mode</th><th>Description</th><th>Use Case</th></tr>
+    <tr><td>Interactive (default)</td><td>REST API accepts SQL statements from clients. Queries defined at runtime via CLI or HTTP.</td><td>Development, exploration, dashboards</td></tr>
+    <tr><td>Headless</td><td>SQL queries defined in a file at startup time. No REST API for new queries. More controlled, predictable resource usage.</td><td>Production deployments where queries are code-reviewed and version-controlled</td></tr>
+    <tr><td>Clustered</td><td>Multiple ksqlDB servers form a consumer group. Queries distributed across nodes for horizontal scale and HA.</td><td>High-throughput production workloads</td></tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Production recommendation:</strong> Use headless mode with queries in version control (GitOps). Interactive mode is powerful for development but risky in production — anyone with REST access can start/stop queries. Headless mode treats SQL as code: reviewed, tested, deployed via CI/CD.</div>
+  </div>
+</div>
+
+<!-- UDFs -->
+<div class="section" id="udfs">
+  <div class="section-header"><span class="section-icon">🔨</span><span class="section-title">UDFs &amp; UDAFs</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>UDF (User Defined Function)</h4>
+      <p>Custom scalar function: takes one or more column values, returns a single value. Example: masked credit card number, geohash from lat/lon, currency conversion. Implement in Java with <code>@UdfDescription</code> and <code>@Udf</code> annotations. Drop JAR in ksqlDB extensions directory.</p>
+    </div>
+    <div class="concept-card">
+      <h4>UDAF (User Defined Aggregate Function)</h4>
+      <p>Custom aggregation: takes many rows, returns one value (like SUM, COUNT but custom). Example: custom rolling percentile, weighted average. Implements <code>Udi</code> interface with <code>aggregate()</code>, <code>merge()</code>, <code>map()</code>, <code>undo()</code> methods.</p>
+    </div>
+    <div class="concept-card">
+      <h4>UDTF (User Defined Table Function)</h4>
+      <p>Explode one row into multiple rows (like SQL LATERAL). Example: split a comma-separated field into individual rows. Used in STREAM processing pipelines.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Deployment</h4>
+      <p>Package UDFs as JARs. Place in <code>ksql.extension.dir</code> on each ksqlDB server. Restart required for new UDFs (or hot-reload in some versions). Functions appear in <code>SHOW FUNCTIONS;</code>.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Concepts &amp; Scenario Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        What is the difference between a Stream and a Table in ksqlDB, and when would you use each?
+        <span class="difficulty d-basic">Basic</span></div>
+      <div class="qa-a">
+        <strong>Stream</strong> represents an immutable sequence of events — like a ledger or audit log. Every record is a new fact. Old records are never updated or deleted. Use a Stream when: capturing transactions (payments, clicks, logins), tracking state changes as events.
+        <br><br>
+        <strong>Table</strong> represents the current state of something. Only the latest record per key is meaningful — previous records are superseded. Use a Table when: you need the current account balance (not all historical transactions), current inventory level, latest user profile.
+        <br><br>
+        <strong>The duality:</strong> A Table IS a Stream at a lower level — it's a compacted view. You can convert: a stream of payment events → a table of running balances (via aggregation). A table → stream of change events (table-to-stream conversion).
+        <br><br>
+        <strong>Practical example:</strong> In banking: <code>payment_events</code> is a Stream (every payment is a new event), <code>account_balances</code> is a Table (latest balance per account). Join them: enrich payment events with current account info.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A ksqlDB persistent query is falling behind with growing consumer lag. How do you scale it?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        ksqlDB scales out by adding more servers to the cluster. Processing partitions of the input Kafka topic are distributed across servers:
+        <ul>
+          <li><strong>Step 1:</strong> Add more ksqlDB servers to the cluster (same <code>ksql.service.id</code>). They join the consumer group automatically. Tasks are rebalanced — each server gets a subset of partitions.</li>
+          <li><strong>Step 2:</strong> Check if input topic has enough partitions. If the topic has only 4 partitions and you have 8 servers, 4 servers idle. Increase topic partition count (requires creating a new topic and migrating, or rebalancing after increasing).</li>
+          <li><strong>Step 3:</strong> If the query involves an aggregation or join with a state store, adding servers also splits state across more nodes — reduces per-node memory/disk pressure.</li>
+          <li><strong>Step 4:</strong> Check if the bottleneck is the query logic itself — complex UDFs or deserialization. Profile the ksqlDB server: CPU, memory, disk I/O on RocksDB state stores.</li>
+        </ul>
+        <strong>Key insight:</strong> ksqlDB parallelism is bounded by the partition count of the input topics. Plan partition count at topic creation time.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        When should you use ksqlDB vs Kafka Streams (Java) vs Flink for stream processing?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        <table style="font-size:13px;color:var(--muted);width:100%">
+          <tr><th style="text-align:left;padding:6px 10px;color:var(--text)">Dimension</th><th style="padding:6px 10px;color:var(--accent)">ksqlDB</th><th style="padding:6px 10px;color:var(--accent)">Kafka Streams</th><th style="padding:6px 10px;color:var(--accent)">Apache Flink</th></tr>
+          <tr><td style="padding:6px 10px">Abstraction</td><td style="padding:6px 10px">SQL</td><td style="padding:6px 10px">Java/Kotlin DSL</td><td style="padding:6px 10px">Java/Python/SQL</td></tr>
+          <tr><td style="padding:6px 10px">Operational complexity</td><td style="padding:6px 10px">Low (managed service or simple cluster)</td><td style="padding:6px 10px">Low (embedded in app)</td><td style="padding:6px 10px">High (separate cluster)</td></tr>
+          <tr><td style="padding:6px 10px">Exactly-once</td><td style="padding:6px 10px">Yes (via Kafka Streams)</td><td style="padding:6px 10px">Yes</td><td style="padding:6px 10px">Yes (native)</td></tr>
+          <tr><td style="padding:6px 10px">Complex state</td><td style="padding:6px 10px">Limited</td><td style="padding:6px 10px">Good</td><td style="padding:6px 10px">Excellent</td></tr>
+          <tr><td style="padding:6px 10px">SQL familiarity</td><td style="padding:6px 10px">Excellent</td><td style="padding:6px 10px">Requires Java knowledge</td><td style="padding:6px 10px">Good (Table API + SQL)</td></tr>
+          <tr><td style="padding:6px 10px">Multi-source joins</td><td style="padding:6px 10px">Limited (Kafka-only)</td><td style="padding:6px 10px">Kafka-only</td><td style="padding:6px 10px">Kafka + DB + many sources</td></tr>
+          <tr><td style="padding:6px 10px">Use when</td><td style="padding:6px 10px">SQL team, simple pipelines, Kafka-native</td><td style="padding:6px 10px">Java teams, embedded in microservice</td><td style="padding:6px 10px">Complex CEP, ML, multi-source, high SLA</td></tr>
+        </table>
+        <br>
+        <strong>In a banking context (HSBC):</strong> ksqlDB for real-time dashboards and simple enrichment (low code, fast iteration). Kafka Streams for event-driven microservices (payment processing logic embedded in the service). Flink for complex fraud detection (CEP patterns, ML model inference, cross-system joins).
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

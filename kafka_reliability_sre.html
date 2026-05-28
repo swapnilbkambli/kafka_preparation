@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Reliability & SRE | HSBC Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <div class="header-role">HSBC · Associate Director · Kafka SRE</div>
+      <h1>Reliability &amp; SRE</h1>
+      <p style="color:var(--text-muted);margin:0">SLOs, Incident Management, Failure Modes, DR, Chaos Engineering</p>
+    </div>
+    <a href="index.html" class="btn-back">← Hub</a>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="toc">
+    <div class="toc-title">Contents</div>
+    <a href="#slos">SLOs &amp; Error Budgets</a>
+    <a href="#failure-modes">Failure Mode Analysis</a>
+    <a href="#runbooks">Incident Runbooks</a>
+    <a href="#dr">Disaster Recovery</a>
+    <a href="#chaos">Chaos Engineering</a>
+    <a href="#capacity">Capacity Planning</a>
+    <a href="#qa">Q &amp; A</a>
+  </nav>
+
+  <main>
+
+    <!-- SLOs & Error Budgets -->
+    <section id="slos">
+      <h2>SLOs &amp; Error Budgets</h2>
+
+      <div class="concept-card">
+        <h3>Kafka SLIs — What to Measure</h3>
+        <p>Service Level Indicators (SLIs) must be meaningful to the Kafka consumers of your service, not just internal operational metrics.</p>
+        <table class="kv-table">
+          <thead><tr><th>SLI Category</th><th>Metric</th><th>Measurement Method</th></tr></thead>
+          <tbody>
+            <tr><td>Availability</td><td>% of produce requests that succeed (non-5xx)</td><td>ProduceRequestRate vs ErrorRate JMX</td></tr>
+            <tr><td>Availability</td><td>% of consume requests that return records</td><td>FetchRequestRate, EmptyFetchRate</td></tr>
+            <tr><td>Latency</td><td>P99 end-to-end produce latency</td><td>producer record-send-total / latency-avg histogram</td></tr>
+            <tr><td>Latency</td><td>P99 broker request queue time</td><td>RequestQueueTimeMs.p99 per request type</td></tr>
+            <tr><td>Durability</td><td>UnderReplicatedPartitions = 0</td><td>ReplicaManager/UnderReplicatedPartitions</td></tr>
+            <tr><td>Consumer Freshness</td><td>Max consumer lag &lt; threshold</td><td>records-lag-max (consumer) or Burrow</td></tr>
+            <tr><td>Data Integrity</td><td>Schema validation failure rate</td><td>Schema Registry 4xx/5xx rate</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Defining SLOs for Kafka Platform</h3>
+        <div class="diagram">
+          <b>SLO Definition Template</b>
+          <pre>
+Service: Kafka Cluster (Production)
+Window: 30-day rolling
+
+SLO 1 — Producer Availability
+  SLI: % produce requests with acks received / total produce requests
+  Target: 99.95% (26 min downtime/month budget)
+  Exclude: client-side errors (TOPIC_AUTH_FAILED, INVALID_MSG), planned maintenance
+
+SLO 2 — Produce Latency
+  SLI: % produce requests completing P99 &lt; 200ms (end-to-end)
+  Target: 99.9%
+  Measurement: broker-side RequestTotalTimeMs.p99 for Produce
+
+SLO 3 — Consumer Lag
+  SLI: % of time all critical consumer groups lag &lt; 10,000 records
+  Target: 99.5%
+  Scope: consumer groups tagged slo=critical
+
+SLO 4 — Data Durability
+  SLI: % of 1-min windows where UnderReplicatedPartitions = 0
+  Target: 99.9%
+
+SLO 5 — Platform Availability (Broker Uptime)
+  SLI: % of time at least min.insync.replicas brokers available per partition
+  Target: 99.99% (4.4 min/month)
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Error Budget Policy</h3>
+        <div class="diagram">
+          <b>Error Budget = 100% - SLO Target</b>
+          <pre>
+Monthly error budget for 99.95% SLO:
+  30 days × 24h × 60min = 43,200 min
+  0.05% × 43,200 = 21.6 minutes of allowed downtime
+
+Budget consumption triggers:
+  &gt;50% consumed (10.8 min)  → freeze non-critical changes
+  &gt;75% consumed (16.2 min)  → freeze ALL changes, postmortem required
+  100% consumed (21.6 min)  → incident review, root cause to engineering
+  Rolling 4-week &lt;10% used   → team earns reliability investment credit
+
+Burn Rate Alert (Prometheus):
+  Fast burn (1h window):   rate &gt; 14.4x budget burn rate → PagerDuty
+  Slow burn (6h window):   rate &gt; 6x budget burn rate   → Slack warning
+
+PromQL:
+  1 - (sum(rate(kafka_produce_errors_total[1h])) /
+       sum(rate(kafka_produce_requests_total[1h])))
+          </pre>
+        </div>
+
+        <div class="callout warn">
+          <strong>Error Budget Burn Rates:</strong> A 14.4x burn rate on a 1h window means you'll exhaust the monthly budget in 50 hours. Alert fast burns with tight windows AND slow burns with wide windows — you need both to avoid missing gradual degradation.
+        </div>
+      </div>
+    </section>
+
+    <!-- Failure Mode Analysis -->
+    <section id="failure-modes">
+      <h2>Failure Mode Analysis</h2>
+
+      <div class="concept-card">
+        <h3>Broker Failure</h3>
+        <table class="kv-table">
+          <thead><tr><th>Scenario</th><th>Impact</th><th>Detection</th><th>Recovery</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Single broker crash</td>
+              <td>Partitions where it was leader become unavailable until election (~30s ZK / &lt;1s KRaft). Followers of remaining brokers continue serving.</td>
+              <td>ActiveControllerCount drops event; UnderReplicatedPartitions spike; broker disappears from <code>/brokers/ids</code></td>
+              <td>Auto: Controller triggers leader election for offline partitions. Manual: restart broker, watch ISR recovery.</td>
+            </tr>
+            <tr>
+              <td>Broker disk full</td>
+              <td>Broker stops accepting writes. Partitions it leads go offline. ISR shrinks across all its partitions.</td>
+              <td><code>LogFlushOffsetCheckpointMs</code> errors; DiskFreeSpace alert; kafka.log.Log errors in broker log</td>
+              <td>Emergency: free space (delete old segments with <code>kafka-delete-records.sh</code>, adjust retention). Permanent: expand disk or add JBOD volume.</td>
+            </tr>
+            <tr>
+              <td>Broker GC pause (&gt;30s)</td>
+              <td>Session timeout causes controller to consider broker dead. ZK session expires. Leader elections for all broker's partitions.</td>
+              <td>GCTimeMs &gt; 10s alert; log shows "Broker heartbeat expired"</td>
+              <td>Tune JVM heap. Switch to G1GC. Reduce <code>-Xmx</code> to leave more page cache. In extreme: add RAM.</td>
+            </tr>
+            <tr>
+              <td>All brokers crash</td>
+              <td>Complete cluster unavailability. Producers get timeout/connection refused. Consumers stall.</td>
+              <td>All broker metrics disappear. Monitoring goes silent.</td>
+              <td>Restart in order: ZK (if applicable) → Controller/KRaft controllers → Brokers. Verify metadata integrity before accepting traffic.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Controller / ZooKeeper / KRaft Failure</h3>
+        <table class="kv-table">
+          <thead><tr><th>Scenario</th><th>Impact</th><th>Recovery Time</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Active Controller crash (ZK mode)</td>
+              <td>No new leader elections or topic changes until new controller elected. Existing produce/consume continues for in-sync partitions.</td>
+              <td>6–30s (ZK session timeout)</td>
+              <td>Any broker can become controller. Monitor <code>ActiveControllerCount</code> — must return to 1. If stuck: restart all brokers.</td>
+            </tr>
+            <tr>
+              <td>ZK quorum loss (minority)</td>
+              <td>ZK still serves reads. No new controller elections possible. Existing state frozen but cluster operates.</td>
+              <td>Auto when quorum restores</td>
+              <td>Restore ZK quorum. ZK ensemble needs majority (3 nodes: need 2, 5 nodes: need 3).</td>
+            </tr>
+            <tr>
+              <td>ZK quorum loss (majority)</td>
+              <td>ZK unavailable. If controller crashes during this, cluster is stuck. No metadata changes.</td>
+              <td>Manual intervention</td>
+              <td>Restore ZK nodes. Critical: pre-plan ZK ensemble sizing. Prefer 5-node ensemble in prod.</td>
+            </tr>
+            <tr>
+              <td>KRaft controller quorum loss (minority)</td>
+              <td>Leader election proceeds with remaining quorum. Single controller failure is transparent (&lt;1s failover).</td>
+              <td>&lt;1 second</td>
+              <td>Restore failed controller nodes. KRaft is far more resilient than ZK for this scenario.</td>
+            </tr>
+            <tr>
+              <td>KRaft quorum loss (majority)</td>
+              <td>No metadata operations possible. Cluster freezes for topology changes. Ongoing produce/consume may continue.</td>
+              <td>Manual quorum recovery</td>
+              <td>Use <code>kafka-metadata-quorum.sh --replication-factor-reset</code> as last resort. Restore from backup of <code>__cluster_metadata</code> log.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Network Partition</h3>
+        <div class="diagram">
+          <b>Split-Brain Scenario (3 brokers, RF=3, min.ISR=2)</b>
+          <pre>
+DC-A: Broker 1 (leader), Broker 2
+DC-B: Broker 3
+Network partition isolates DC-B from DC-A
+
+Timeline:
+T=0   Partition begins
+T=30s Broker 3 loses ZK session → evicted from ISR
+      Broker 1 continues serving with ISR={1,2} ✓ (quorum met)
+T=30s Broker 3 in DC-B tries to elect itself (if ZK in DC-B)
+      → Split-brain: broker 3 becomes leader for its view
+
+Impact of unclean.leader.election.enable=true:
+  - DC-B producers can write to broker 3
+  - After partition heals, log diverges → data loss possible
+
+Impact of unclean.leader.election.enable=false (recommended):
+  - DC-B partitions go OFFLINE when broker 3 is only ISR member
+  - No data loss possible, but DC-B is unavailable
+
+Recovery after partition heals:
+  - ISR reconciliation by controller
+  - Follower with stale data truncates to leader's high-water mark
+  - Rejected messages from isolated period are LOST
+          </pre>
+        </div>
+
+        <div class="callout danger">
+          <strong>Data Loss Risk:</strong> With <code>unclean.leader.election.enable=true</code> + a network partition, data loss is virtually guaranteed when the partition heals. Always set to <code>false</code> in production.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Disk / Storage Failure</h3>
+        <table class="kv-table">
+          <thead><tr><th>Failure Type</th><th>Kafka Behavior</th><th>Mitigation</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Single disk failure (no JBOD)</td>
+              <td>Broker shuts down entirely. All partitions on that broker become unavailable.</td>
+              <td>JBOD (multiple disks). With JBOD, only partitions on the failed disk are affected; broker stays running.</td>
+            </tr>
+            <tr>
+              <td>Single disk failure (JBOD)</td>
+              <td>Partitions on failed disk go offline. Broker continues serving partitions on healthy disks. ISR shrinks for affected partitions.</td>
+              <td>JBOD is the SRE best practice. Replace disk, reassign partitions (<code>kafka-reassign-partitions.sh</code>).</td>
+            </tr>
+            <tr>
+              <td>Disk I/O saturation</td>
+              <td>Log flush latency spikes → broker appears slow → replica lag → ISR shrinkage. Producer latency increases.</td>
+              <td>Monitor <code>LogFlushRateAndTimeMs</code>. Use io scheduler=none for NVMe. Separate Kafka data from OS on different disks.</td>
+            </tr>
+            <tr>
+              <td>Filesystem corruption</td>
+              <td>Broker may fail to load partition logs. Kafka log recovery runs on startup (replays from last checkpoint).</td>
+              <td>Kafka log recovery is automatic. For severe corruption: restore from replica on another broker. <code>num.recovery.threads.per.data.dir=4</code> speeds startup.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Consumer Failure Modes</h3>
+        <table class="kv-table">
+          <thead><tr><th>Failure</th><th>Symptom</th><th>Root Cause</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Consumer group rebalance loop</td>
+              <td>Lag oscillates, consumers restart repeatedly, rebalance-rate-per-hour &gt; 4</td>
+              <td>Processing time &gt; <code>max.poll.interval.ms</code>. Consumer is kicked from group during processing.</td>
+              <td>Increase <code>max.poll.interval.ms</code>. Reduce <code>max.poll.records</code>. Move heavy processing to async worker thread.</td>
+            </tr>
+            <tr>
+              <td>Zombie consumer</td>
+              <td>Partition assigned to consumer, but no progress. Lag grows. Heartbeat still valid.</td>
+              <td>Consumer thread deadlocked or stuck, but heartbeat thread still running (separate threads in modern clients).</td>
+              <td>Add application-level watchdog. Monitor <code>poll-idle-ratio-avg</code> — should not be 0.</td>
+            </tr>
+            <tr>
+              <td>Offset commit failure</td>
+              <td>Consumer reprocesses records after restart. Exactly-once guarantees violated.</td>
+              <td>Auto-commit during rebalance, or manual commit failures not caught.</td>
+              <td>Use <code>enable.auto.commit=false</code>. Implement idempotent consumers. Use transactions for EOS.</td>
+            </tr>
+            <tr>
+              <td>Deserialization failure</td>
+              <td>Consumer crashes on specific record. DLQ not configured. Entire partition blocked.</td>
+              <td>Schema mismatch, corrupt record, or incompatible schema evolution.</td>
+              <td>Configure DLQ (<code>errors.tolerance=all</code> in Connect, or custom try/catch). Enforce Schema Registry compatibility.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Incident Runbooks -->
+    <section id="runbooks">
+      <h2>Incident Runbooks</h2>
+
+      <div class="concept-card">
+        <h3>Runbook: UnderReplicatedPartitions &gt; 0</h3>
+        <ol class="step-list">
+          <li>
+            <strong>Assess scope</strong>
+            <div class="diagram"><pre>
+# How many URPs and which brokers?
+kafka-topics.sh --bootstrap-server :9092 \
+  --describe --under-replicated-partitions
+
+# Which broker is lagging (the replica)?
+kafka-topics.sh --bootstrap-server :9092 \
+  --describe --under-replicated-partitions | awk '{print $8}' | sort | uniq -c
+            </pre></div>
+          </li>
+          <li>
+            <strong>Check replica lag metric on the lagging broker</strong>
+            <div class="diagram"><pre>
+# JMX: kafka.server:type=ReplicaFetcherManager,name=MaxLag,clientId=Replica
+# Also check: kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions
+            </pre></div>
+          </li>
+          <li>
+            <strong>Check if broker is healthy</strong>
+            <p>CPU, disk I/O, network bandwidth. Look for GC pauses in broker log. Check <code>kafka.server:type=BrokerTopicMetrics</code> for disk latency.</p>
+          </li>
+          <li>
+            <strong>Is the broker in ISR?</strong>
+            <p>If broker is in ISR but URP &gt; 0, data is being written faster than it can replicate (replica.lag.time.max.ms exceeded). Throttle producers or add brokers.</p>
+          </li>
+          <li>
+            <strong>If broker is OOS (out of sync)</strong>
+            <p>Check <code>replica.lag.time.max.ms</code> (default 30s). If disk I/O is causing lag, check IOPS. If network, check <code>replica.fetch.max.bytes</code> and <code>num.replica.fetchers</code>.</p>
+          </li>
+          <li>
+            <strong>Resolution path</strong>
+            <div class="diagram"><pre>
+URP stays high after broker recovery?
+→ Manual reassignment: kafka-reassign-partitions.sh
+→ Throttle replication to avoid impacting production:
+  kafka-configs.sh --bootstrap-server :9092 --entity-type brokers \
+    --entity-name BROKER_ID --alter \
+    --add-config 'leader.replication.throttled.rate=50000000,
+                  follower.replication.throttled.rate=50000000'
+            </pre></div>
+          </li>
+        </ol>
+      </div>
+
+      <div class="concept-card">
+        <h3>Runbook: Consumer Lag Spike</h3>
+        <ol class="step-list">
+          <li>
+            <strong>Identify which consumer groups are lagging</strong>
+            <div class="diagram"><pre>
+kafka-consumer-groups.sh --bootstrap-server :9092 --list
+kafka-consumer-groups.sh --bootstrap-server :9092 \
+  --describe --group GROUPNAME
+# Look for: LAG column, CONSUMER-ID, HOST
+
+# Burrow: GET /v3/kafka/local/consumer/GROUPNAME/lag
+            </pre></div>
+          </li>
+          <li>
+            <strong>Determine: is lag growing or stable?</strong>
+            <p>Growing lag = consumer can't keep up with producer rate. Stable high lag = consumer is at steady state, just behind. Growing is the emergency.</p>
+          </li>
+          <li>
+            <strong>Check consumer health</strong>
+            <p>Is consumer running? Check <code>rebalance-rate-per-hour</code> — if high, fix rebalance first. Check <code>max.poll.interval.ms</code> violations in consumer logs.</p>
+          </li>
+          <li>
+            <strong>Check if it's a throughput problem</strong>
+            <div class="diagram"><pre>
+# Producer rate vs consumer rate comparison
+kafka-consumer-groups.sh --bootstrap-server :9092 \
+  --describe --group GROUPNAME --verbose
+
+# Tune consumer to increase throughput:
+fetch.min.bytes=1048576    # 1MB minimum fetch
+max.poll.records=2000
+fetch.max.wait.ms=500
+            </pre></div>
+          </li>
+          <li>
+            <strong>Scale out if needed</strong>
+            <p>Add consumer instances (up to partition count). Verify partition count ≥ desired consumer parallelism. If not, increase partition count and do rolling restart of consumers.</p>
+          </li>
+        </ol>
+      </div>
+
+      <div class="concept-card">
+        <h3>Runbook: OfflinePartitionsCount &gt; 0</h3>
+        <div class="callout danger">
+          <strong>P1 Incident.</strong> Offline partitions mean writes and reads are completely failing for those topics. This impacts application SLAs directly.
+        </div>
+        <ol class="step-list">
+          <li>
+            <strong>Find offline partitions</strong>
+            <div class="diagram"><pre>
+kafka-topics.sh --bootstrap-server :9092 \
+  --describe --unavailable-partitions
+# Shows partitions with no leader elected
+            </pre></div>
+          </li>
+          <li>
+            <strong>Identify why — are the partition's ISR members running?</strong>
+            <p>If all ISR members are down → partition goes offline with <code>unclean.leader.election.enable=false</code>. Restore at least one ISR broker.</p>
+          </li>
+          <li>
+            <strong>Unclean leader election (last resort)</strong>
+            <div class="diagram"><pre>
+# Only if data loss is acceptable and availability > durability:
+kafka-leader-election.sh --bootstrap-server :9092 \
+  --election-type UNCLEAN \
+  --topic TOPICNAME --partition 0
+# Or for all partitions:
+kafka-leader-election.sh --bootstrap-server :9092 \
+  --election-type UNCLEAN --all-topic-partitions
+            </pre></div>
+          </li>
+          <li>
+            <strong>Post-incident: root cause</strong>
+            <p>Document which broker failed. Review replication.factor (should be ≥ 3). Review min.insync.replicas (should be RF-1). Consider adding brokers to reduce single-broker partition density.</p>
+          </li>
+        </ol>
+      </div>
+
+      <div class="concept-card">
+        <h3>Runbook: Broker Disk Full</h3>
+        <ol class="step-list">
+          <li><strong>Immediate: pause writes to that broker</strong> — Route producers away if possible via partition reassignment with throttle.</li>
+          <li>
+            <strong>Emergency space recovery</strong>
+            <div class="diagram"><pre>
+# Option 1: Reduce retention immediately
+kafka-configs.sh --bootstrap-server :9092 \
+  --entity-type topics --entity-name TOPICNAME --alter \
+  --add-config retention.ms=3600000  # 1 hour
+
+# Option 2: Delete records up to offset
+kafka-delete-records.sh --bootstrap-server :9092 \
+  --offset-json-file delete-offsets.json
+
+# Option 3: Find and delete temp/log files
+ls -lhS /kafka/data/  # find largest files
+# Never delete .log files manually — use Kafka's tools
+            </pre></div>
+          </li>
+          <li>
+            <strong>Long-term: expand storage</strong>
+            <p>Add JBOD volume (online via <code>kafka-configs.sh --alter --add-config log.dirs=...</code>). Or migrate partitions to other brokers with throttled reassignment.</p>
+          </li>
+          <li>
+            <strong>Alert tuning</strong>
+            <p>Set disk alert at 70% to give lead time. Track growth rate. Model projected full time in Grafana.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Disaster Recovery -->
+    <section id="dr">
+      <h2>Disaster Recovery</h2>
+
+      <div class="concept-card">
+        <h3>RTO and RPO for Kafka</h3>
+        <table class="kv-table">
+          <thead><tr><th>Scenario</th><th>Target RTO</th><th>Target RPO</th><th>Strategy</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Single broker failure</td>
+              <td>&lt; 1 min (KRaft) / &lt; 60s (ZK)</td>
+              <td>0 (no data loss with RF≥2, min.ISR)</td>
+              <td>Auto leader election. No operator action needed.</td>
+            </tr>
+            <tr>
+              <td>AZ failure</td>
+              <td>&lt; 5 min</td>
+              <td>0 with stretch cluster across 3 AZs</td>
+              <td>Spread replicas across AZs. Use rack-aware replication. RF=3 with 1 replica per AZ.</td>
+            </tr>
+            <tr>
+              <td>Full DC failure</td>
+              <td>15–30 min</td>
+              <td>&lt; 30s (async MM2) to 0 (sync replication)</td>
+              <td>MirrorMaker 2 active-passive. Failover: redirect producers to DR cluster. Consumers reconnect.</td>
+            </tr>
+            <tr>
+              <td>Data corruption / accidental deletion</td>
+              <td>1–4 hours</td>
+              <td>Last backup point</td>
+              <td>Topic-level backup to S3 (Kafka S3 Sink connector). Point-in-time replay from offsets.</td>
+            </tr>
+            <tr>
+              <td>Full cluster loss</td>
+              <td>2–8 hours</td>
+              <td>Depends on replication lag to DR</td>
+              <td>DR cluster warm standby + MM2 sync. Automate failover via DNS/load balancer switch.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>MirrorMaker 2 Active-Passive Failover</h3>
+        <div class="diagram">
+          <b>Normal Operation</b>
+          <pre>
+Production Cluster (DC-A)           DR Cluster (DC-B)
+┌─────────────────────────┐         ┌─────────────────────────┐
+│  Topics: payments,       │──MM2──▶│  Topics: dc-a.payments, │
+│          orders, events  │        │  dc-a.orders, dc-a.events│
+│  Producers writing here  │        │  (prefixed by MM2)       │
+└─────────────────────────┘         └─────────────────────────┘
+                                     MM2 also syncs:
+                                     - Consumer offsets
+                                     - ACLs (if configured)
+                                     - Topic configs
+          </pre>
+          <b>Failover Procedure</b>
+          <pre>
+1. Detect DC-A failure (monitoring alert)
+2. Stop MM2 to prevent stale writes to DC-B
+3. Translate consumer offsets:
+   kafka-mirror-maker.sh --translate-offsets \
+     --consumer-config dc-b-consumer.properties \
+     --topics-to-migrate payments,orders
+4. Update producer bootstrap.servers to DC-B
+5. Update consumer bootstrap.servers to DC-B
+   Consumers will resume from translated offsets (no replay needed)
+6. Verify lag = 0 on DC-B consumers
+7. (After DC-A recovery) set up reverse MM2 DC-B → DC-A
+8. Failback once DC-A is fully healthy
+          </pre>
+        </div>
+
+        <div class="callout warn">
+          <strong>Offset Translation Gap:</strong> MM2 syncs offsets periodically (default 60s). The last 60s of messages before failover may require replay. Design consumers to be idempotent to handle this.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Backup Strategies</h3>
+        <table class="kv-table">
+          <thead><tr><th>Method</th><th>Mechanism</th><th>RPO</th><th>Trade-off</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>MirrorMaker 2</td>
+              <td>Consumer → Producer replication between clusters</td>
+              <td>Async: seconds to minutes</td>
+              <td>Best for DR. Topic data + offset sync. Adds consumer load to source cluster.</td>
+            </tr>
+            <tr>
+              <td>S3 Sink Connector</td>
+              <td>Kafka → S3 via Connect. Stores as Parquet/Avro/JSON</td>
+              <td>Flush interval (default 1000 records or 1min)</td>
+              <td>Good for cold backup and analytics. Replay requires writing back to Kafka.</td>
+            </tr>
+            <tr>
+              <td>Tiered Storage (Kafka 3.6+)</td>
+              <td>Remote log manager uploads segments to S3/GCS/Azure</td>
+              <td>Segment roll interval (default 1GB or 1 week)</td>
+              <td>Native Kafka solution. Reduces local disk. Not a DR solution — same cluster metadata required.</td>
+            </tr>
+            <tr>
+              <td>Filesystem snapshot</td>
+              <td>Pause partition, snapshot EBS/PD volume, resume</td>
+              <td>Point in time</td>
+              <td>Fast restore. Requires coordination. Risk of partial writes if not done carefully.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Chaos Engineering -->
+    <section id="chaos">
+      <h2>Chaos Engineering</h2>
+
+      <div class="concept-card">
+        <h3>Chaos Hypothesis Framework for Kafka</h3>
+        <p>For each chaos experiment, define: <strong>Steady State</strong> → <strong>Hypothesis</strong> → <strong>Blast Radius</strong> → <strong>Rollback Plan</strong> → <strong>Observation</strong></p>
+
+        <div class="diagram">
+          <b>Example: Broker Kill Experiment</b>
+          <pre>
+Steady State:
+  - consumer lag &lt; 1000 for all critical groups
+  - UnderReplicatedPartitions = 0
+  - P99 produce latency &lt; 100ms
+
+Hypothesis:
+  Killing broker-2 (non-controller) will cause transient URP spike
+  (&lt;30s) and then auto-recovery. Consumer lag will not exceed 10,000.
+
+Blast Radius:
+  Partitions where broker-2 is leader (~33% of partitions in 3-broker cluster)
+  Estimated: 10-15 seconds of elevated latency for those partitions
+
+Rollback:
+  Restart broker-2: systemctl start kafka
+
+Experiment:
+  kill -9 $(jps | grep Kafka | awk '{print $1}') on broker-2
+
+Observe:
+  - URP alert fires? Time to recovery?
+  - Consumer lag spike? Duration?
+  - Producer errors? (ErrorRate metric)
+  - Auto leader election completed in expected time?
+
+Conclusion:
+  PASS if: recovery &lt; 60s, no consumer lag breach, no data loss
+  FAIL if: manual intervention required, lag exceeded threshold
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Chaos Experiment Catalog</h3>
+        <table class="kv-table">
+          <thead><tr><th>Experiment</th><th>Method</th><th>What to Verify</th><th>Frequency</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Kill single broker (non-controller)</td>
+              <td><code>kill -9</code> or <code>systemctl stop kafka</code></td>
+              <td>Auto recovery &lt;60s, consumer lag recovers, URP returns to 0</td>
+              <td>Monthly</td>
+            </tr>
+            <tr>
+              <td>Kill controller broker</td>
+              <td>Stop broker with ActiveController=1</td>
+              <td>New controller elected, no split-brain, cluster metadata intact</td>
+              <td>Quarterly</td>
+            </tr>
+            <tr>
+              <td>Kill ZK/KRaft controller (1 of 3)</td>
+              <td>Stop one ZK node or KRaft controller</td>
+              <td>Quorum maintained, metadata operations continue, no broker impact</td>
+              <td>Quarterly</td>
+            </tr>
+            <tr>
+              <td>Network partition (tc netem)</td>
+              <td><code>tc qdisc add dev eth0 root netem loss 30%</code></td>
+              <td>Retry logic activates, ISR shrinks then recovers after healing</td>
+              <td>Quarterly</td>
+            </tr>
+            <tr>
+              <td>Disk fill (fallocate)</td>
+              <td><code>fallocate -l 50G /kafka/data/fill.tmp</code></td>
+              <td>Alert fires before ENOSPC, operator runbook effective</td>
+              <td>Semi-annually</td>
+            </tr>
+            <tr>
+              <td>Schema Registry kill</td>
+              <td>Stop SR service</td>
+              <td>Producers with cached schemas continue, new schemas fail gracefully</td>
+              <td>Monthly</td>
+            </tr>
+            <tr>
+              <td>Consumer kill during processing</td>
+              <td">Kill consumer mid-batch</td>
+              <td>Rebalance completes, no duplicate records (idempotent), no data loss</td>
+              <td>Monthly</td>
+            </tr>
+            <tr>
+              <td>DR failover drill</td>
+              <td>Simulate DC-A loss, fail over to DC-B</td>
+              <td>RTO met, RPO met, offset translation correct, apps reconnect</td>
+              <td>Semi-annually</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <strong>Chaos on Production:</strong> Start chaos experiments in staging. Promote to production only after 3+ clean staging runs. Always have an incident bridge open during prod chaos. Start with the smallest blast radius (single partition → single broker → full broker failure).
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Chaos Tools for Kafka</h3>
+        <table class="kv-table">
+          <thead><tr><th>Tool</th><th>Use Case</th></tr></thead>
+          <tbody>
+            <tr><td>Chaos Monkey (Netflix)</td><td>Random instance termination in AWS/K8s</td></tr>
+            <tr><td>Litmus Chaos (K8s)</td><td>Pod kill, disk fill, CPU stress on K8s-deployed Kafka (Strimzi)</td></tr>
+            <tr><td>Toxiproxy</td><td>Network fault injection: latency, packet loss, connection reset between clients and brokers</td></tr>
+            <tr><td>tc netem</td><td>OS-level network emulation (latency, loss, duplication, corruption)</td></tr>
+            <tr><td>stress-ng</td><td>CPU, memory, I/O stress on broker host</td></tr>
+            <tr><td>Pumba</td><td>Docker/K8s container chaos: kill, delay, loss</td></tr>
+            <tr><td>Gremlin</td><td>Commercial; structured chaos experiments with rollback</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Capacity Planning -->
+    <section id="capacity">
+      <h2>Capacity Planning</h2>
+
+      <div class="concept-card">
+        <h3>Kafka Sizing Formula</h3>
+        <div class="diagram">
+          <b>Storage Required (per broker)</b>
+          <pre>
+Storage = (msg_rate × avg_msg_size × retention_seconds × replication_factor)
+          ÷ num_brokers
+
+Example:
+  msg_rate = 500,000 msg/s
+  avg_msg_size = 1 KB
+  retention = 7 days = 604,800s
+  RF = 3, brokers = 6
+
+Storage = (500,000 × 1024 × 604,800 × 3) / 6
+        = 500,000 × 1024 × 604,800 × 0.5
+        = ~153 TB total → ~25.5 TB per broker
+
+Add 20% headroom → ~30 TB per broker (SSD or JBOD)
+          </pre>
+          <b>Throughput Headroom</b>
+          <pre>
+Network bandwidth per broker:
+  - Each broker receives replicas from others
+  - Replication traffic = msg_rate × (RF-1) / num_brokers
+  - Plus consumer fetch traffic
+
+Rule of thumb:
+  Use at most 50% of NIC bandwidth for Kafka traffic
+  10GbE NIC → 1.2 GB/s max → target 600 MB/s per broker
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Capacity Signals and Alerts</h3>
+        <table class="kv-table">
+          <thead><tr><th>Resource</th><th>Warning Threshold</th><th>Critical Threshold</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td>Disk usage per broker</td><td>70%</td><td>85%</td><td>Reduce retention, add JBOD, or expand cluster</td></tr>
+            <tr><td>Network bandwidth (bytes in+out)</td><td>60% of NIC</td><td>80% of NIC</td><td>Add brokers or reduce RF on low-priority topics</td></tr>
+            <tr><td>RequestHandlerAvgIdlePercent</td><td>&lt;50%</td><td>&lt;30%</td><td>Increase <code>num.io.threads</code> or add brokers</td></tr>
+            <tr><td>NetworkProcessorAvgIdlePercent</td><td>&lt;50%</td><td>&lt;30%</td><td>Increase <code>num.network.threads</code></td></tr>
+            <tr><td>Partition count per broker</td><td>2,000</td><td>4,000</td><td>Add brokers, redistribute partitions</td></tr>
+            <tr><td>Leader count per broker</td><td>Imbalance &gt;20%</td><td>Imbalance &gt;30%</td><td>Run preferred leader election</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Q&A -->
+    <section id="qa">
+      <h2>Q &amp; A</h2>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-senior">Senior</span> How would you design SLOs for a Kafka platform serving 50 microservices with different criticality levels?</div>
+        <div class="qa-a">
+          <p>I'd tier the services by criticality and assign SLOs per tier rather than per service:</p>
+          <ul>
+            <li><strong>Tier 1 (payments, fraud detection):</strong> 99.99% availability SLO, P99 produce latency &lt;50ms, consumer lag &lt;100. Error budget: 4.4 min/month. Any change requires error budget approval.</li>
+            <li><strong>Tier 2 (order events, notifications):</strong> 99.95% availability SLO, P99 &lt;200ms, consumer lag &lt;10,000. Error budget: 21.6 min/month.</li>
+            <li><strong>Tier 3 (analytics, batch):</strong> 99.9%, no latency SLO, lag &lt;1M records. Error budget: 43 min/month.</li>
+          </ul>
+          <p>SLI measurement: use separate Kafka clusters or at minimum separate listener + quota policies per tier. Measure SLIs at the Kafka API layer (broker-side metrics), not application-side, to avoid client bugs distorting the signal.</p>
+          <p>Error budget policy: at &gt;75% burn, we freeze Tier 1 changes. Tier 3 changes always allowed unless they would impact Tier 1 (e.g., noisy-neighbor disk I/O). Quarterly reviews with service owners to adjust targets based on actual user impact.</p>
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-senior">Senior</span> Walk me through a Kafka disaster recovery failover. What are the exact steps and where are the risks?</div>
+        <div class="qa-a">
+          <p><strong>Pre-failover (maintain continuously):</strong></p>
+          <ul>
+            <li>MirrorMaker 2 replicating all topics from DC-A → DC-B with <code>sync.group.offsets.enabled=true</code></li>
+            <li>Monitor MM2 replication lag via <code>kafka_consumer_group_lag</code> on MM2's internal consumer group</li>
+            <li>Run monthly DR drills to verify the process actually works</li>
+          </ul>
+          <p><strong>Failover execution:</strong></p>
+          <ol>
+            <li>Confirm DC-A is truly down (not a network blip) — wait 2-3 minutes or confirm with cloud provider</li>
+            <li>Stop MM2 replication (prevent stale writes to DR if DC-A recovers unexpectedly)</li>
+            <li>Translate offsets: <code>kafka-mirror-maker.sh --translate-offsets</code> — this maps DC-A offsets to equivalent DC-B offsets</li>
+            <li>Update DNS / load balancer to point bootstrap.servers at DC-B</li>
+            <li>Verify offset translation: run <code>kafka-consumer-groups.sh --describe</code> on DC-B and confirm lag is reasonable (not replaying from 0)</li>
+            <li>Monitor consumer lag and producer errors for 15 minutes</li>
+          </ol>
+          <p><strong>Risks:</strong></p>
+          <ul>
+            <li><strong>Offset sync gap:</strong> MM2 syncs offsets every 60s by default. Last 60s of messages may replay. Consumers must be idempotent.</li>
+            <li><strong>Topic name mismatch:</strong> MM2 prefixes topics with cluster alias by default (e.g., <code>dc-a.payments</code>). Consumer configs must be updated or use <code>replication.policy.class=IdentityReplicationPolicy</code>.</li>
+            <li><strong>ACL migration:</strong> If ACLs not synced, producers/consumers may get authorization failures on DR cluster</li>
+            <li><strong>Schema Registry:</strong> Must also be failed over or pointed at the DR SR instance. Schema IDs must match between clusters.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-senior">Senior</span> How do you implement chaos engineering for Kafka without risking production data?</div>
+        <div class="qa-a">
+          <p><strong>Guardrails first:</strong> Before any chaos experiment, I define the <em>steady state</em> mathematically (lag &lt; X, URP = 0, etc.), a specific hypothesis, the rollback command ready in a terminal, and a hard stop condition (if metric Y is breached, stop immediately).</p>
+          <p><strong>Blast radius control:</strong> Start with a single non-critical topic. Use traffic shadowing: replay 5% of production traffic to a chaos cluster before running on production. Never run chaos during high-traffic periods (market open for financial services).</p>
+          <p><strong>For Kafka specifically:</strong></p>
+          <ul>
+            <li>Broker kill: use <code>systemctl stop</code>, not <code>kill -9</code>, so Kafka flushes logs cleanly. Only use <code>kill -9</code> to specifically test unclean shutdown recovery.</li>
+            <li>Network chaos: use Toxiproxy or <code>tc netem</code> with a time limit: <code>tc qdisc del dev eth0 root</code> reverts instantly</li>
+            <li>Disk fill: use a temp file (<code>fallocate</code>) that can be instantly deleted</li>
+          </ul>
+          <p><strong>Observability during chaos:</strong> Keep a metrics dashboard open. Have Burrow/kminion consumer lag visible. Set up a temporary tight alert (lag &gt; 500 → Slack) that you turn off after the experiment.</p>
+          <p><strong>Game day format:</strong> Quarterly game days with cross-functional teams (SRE + app teams). Document results. Failed experiments (where the system didn't behave as hypothesized) are the most valuable ones — they reveal real gaps.</p>
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <div class="qa-q"><span class="d-mid">Mid</span> A broker's UnderReplicatedPartitions suddenly spikes to 50 at 2 AM. Walk me through your response.</div>
+        <div class="qa-a">
+          <p><strong>Immediate triage (&lt;5 min):</strong></p>
+          <ol>
+            <li>Open Grafana: which broker is the common follower across those 50 URPs? <code>kafka-topics.sh --describe --under-replicated-partitions | grep -oP "(?&lt;=Isr: )[0-9,]+"</code></li>
+            <li>Is that broker alive? Check broker JMX metrics. Is it in ZK/KRaft membership?</li>
+            <li>Check broker logs for obvious errors: OOM, disk full, network errors</li>
+          </ol>
+          <p><strong>If broker is alive but lagging:</strong></p>
+          <ul>
+            <li>Check disk I/O — is <code>LogFlushRateAndTimeMs</code> spiked? Could be a compaction or heavy write storm</li>
+            <li>Check GC logs — was there a long GC pause that caused the replica to fall behind?</li>
+            <li>Check <code>replica.lag.time.max.ms</code> — if lag exceeded this threshold, ISR eviction happened. Broker will rejoin ISR once it catches up (automatically).</li>
+            <li>Monitor URP trend — is it decreasing (broker catching up) or stable/increasing (broker stuck)?</li>
+          </ul>
+          <p><strong>If broker is dead:</strong></p>
+          <ul>
+            <li>Restart it: <code>systemctl start kafka</code></li>
+            <li>Watch URP during recovery — it will stay high until replicas catch up</li>
+            <li>Apply replication throttle to avoid starving producers during catchup</li>
+          </ul>
+          <p><strong>SLA decision:</strong> Check <code>min.insync.replicas</code>. If ISR count is still above min.ISR, producers are not impacted. Document the incident, set follow-up for root cause analysis in business hours.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+</body>
+</html>

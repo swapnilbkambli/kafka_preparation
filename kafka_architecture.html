@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Architecture & Internals — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🏗️ Kafka Architecture &amp; Internals</h1>
+  <div class="header-right"><span class="pill pill-blue">Concepts</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#broker-threads">Broker Thread Model</a>
+  <a href="#request-queue">Request/Response Queues</a>
+  <a href="#influx">Handling Sudden Influx</a>
+  <a href="#log-internals">Log Internals on Disk</a>
+  <a href="#page-cache">Page Cache &amp; Zero-Copy</a>
+  <a href="#producer-lifecycle">Producer Lifecycle</a>
+  <a href="#consumer-lifecycle">Consumer Fetch Lifecycle</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Broker Thread Model -->
+<div class="section" id="broker-threads">
+  <div class="section-header"><span class="section-icon">🧵</span><span class="section-title">Broker Thread Model</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Kafka brokers are highly concurrent and use a specific multi-threaded architecture to serve thousands of connections efficiently. Understanding this is critical for SRE-level debugging.</p>
+
+  <div class="diagram">  CLIENT                         BROKER PROCESS
+  ──────                         ──────────────────────────────────────────────
+
+  Producer ──TCP──►  [Acceptor Thread]  (1 per listener)
+  Consumer                   │
+  Admin CLI         ┌────────┴────────────────────────────────┐
+                    │                                         │
+               NetworkThread-1  NetworkThread-2  NetworkThread-N
+               (NIO Selector)   (NIO Selector)   (NIO Selector)
+               num.network.threads = 3 (default)
+                    │                │                 │
+                    └────────────────┴────────┬────────┘
+                                              ▼
+                                    [ Request Queue ]
+                                    queued.max.requests = 500
+                                    queued.max.request.bytes = default unlimited
+                                              │
+                    ┌─────────────────────────┼─────────────────────────┐
+                    │                         │                         │
+               IOThread-1              IOThread-2              IOThread-N
+               num.io.threads = 8 (default, should match disk count)
+                    │                         │                         │
+                    └─────────────────────────┼─────────────────────────┘
+                                              ▼
+                              [ Response Queues ] (per NetworkThread)
+                                              │
+                              NetworkThreads drain → write back to client socket</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Acceptor Thread</h4>
+      <p>One per listener (PLAINTEXT, SSL, etc.). Accepts incoming TCP connections and hands them off to NetworkThreads using round-robin. Never does I/O itself — just connection registration.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Network Threads</h4>
+      <p>NIO-based selector threads. Each manages many connections. Reads raw bytes from sockets, parses Kafka protocol frames, and enqueues <code>RequestChannel.Request</code> objects. Also drains response queues and writes bytes back to sockets. Config: <code>num.network.threads</code> (default 3).</p>
+    </div>
+    <div class="concept-card">
+      <h4>Request Queue</h4>
+      <p>A single bounded blocking queue shared by all network threads. IO threads consume from it. Config: <code>queued.max.requests</code> (default 500). When full, network threads <strong>stop reading</strong> from sockets — this is the back-pressure mechanism.</p>
+    </div>
+    <div class="concept-card">
+      <h4>IO Threads</h4>
+      <p>The workhorse threads. Dequeue requests, execute the actual logic (write to log, read from disk, update metadata), and enqueue responses. Config: <code>num.io.threads</code> (default 8). Should roughly match number of storage volumes for disk-bound workloads.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Purgatory (Delayed Requests)</h4>
+      <p>Requests that can't be completed immediately (waiting for ISR acks, or waiting for enough fetch data) are parked in a <strong>Purgatory</strong> — a time-wheel based structure. When the condition is met, the delayed operation completes and the response is enqueued.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Response Queue</h4>
+      <p>Per-NetworkThread queue. IO threads route responses to the correct NetworkThread's response queue. The NetworkThread drains it and writes bytes back to the client socket. This avoids lock contention on a single response queue.</p>
+    </div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>Config</th><th>Default</th><th>Tuning Guidance</th></tr>
+    <tr><td><code>num.network.threads</code></td><td>3</td><td>Increase if CPU is bottlenecked on network parsing. 4–6 for high-connection clusters.</td></tr>
+    <tr><td><code>num.io.threads</code></td><td>8</td><td>Match to number of data disks. 8–16 for multi-disk setups. More doesn't always help.</td></tr>
+    <tr><td><code>queued.max.requests</code></td><td>500</td><td>Raise cautiously (1000–2000) for bursty workloads. Too high → memory pressure.</td></tr>
+    <tr><td><code>queued.max.request.bytes</code></td><td>-1 (unlimited)</td><td>Set a cap (e.g., 200MB) to prevent OOM during traffic spikes.</td></tr>
+    <tr><td><code>socket.send.buffer.bytes</code></td><td>102400</td><td>Increase for high-latency networks (128KB–1MB).</td></tr>
+    <tr><td><code>socket.receive.buffer.bytes</code></td><td>102400</td><td>Same as above — absorbs TCP bursts.</td></tr>
+  </table>
+</div>
+
+<!-- Request/Response Queues -->
+<div class="section" id="request-queue">
+  <div class="section-header"><span class="section-icon">📨</span><span class="section-title">Request &amp; Response Queue Deep Dive</span></div>
+
+  <div class="diagram">  PRODUCE REQUEST FLOW:
+  ─────────────────────────────────────────────────────
+  Producer sends Produce(acks=all, records=[...])
+      │
+      ▼
+  NetworkThread reads bytes → parses → Request{type=PRODUCE}
+      │
+      ▼
+  RequestQueue.enqueue(request)           ← blocks if queue full (back-pressure)
+      │
+      ▼
+  IOThread.dequeue()
+    → appends to partition log (page cache write)
+    → if acks=all:  park in ProducePurgatory (wait for follower acks)
+    → if acks=1:    immediately enqueue Response
+    → if acks=0:    immediately enqueue Response (empty)
+      │
+      ▼
+  Follower FetchRequest arrives → IOThread processes
+    → follower acknowledged → ProducePurgatory fires
+    → Response{offset=N} enqueued to NetworkThread-X response queue
+      │
+      ▼
+  NetworkThread-X writes response bytes to producer socket
+
+  FETCH (CONSUMER) REQUEST FLOW:
+  ─────────────────────────────────────────────────────
+  Consumer sends Fetch(partition=P0, offset=100, min_bytes=1, max_wait=500ms)
+      │
+      ▼
+  IOThread: check if enough data available at offset 100
+    → if YES: read from page cache → Response immediately
+    → if NO:  park in FetchPurgatory (DelayedFetch)
+              wakes on: new data arrives OR max_wait timeout
+      │
+      ▼
+  Response sent via NetworkThread → consumer processes records</div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Key insight for interviews:</strong> Kafka's fetch purgatory is what enables long-polling (efficient push-like behavior). Consumers don't busy-poll — they issue a fetch request with <code>fetch.max.wait.ms</code> and the broker parks it until data arrives. This is why Kafka can handle millions of idle consumers without burning CPU.</div>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Request queue saturation:</strong> When <code>queued.max.requests</code> is hit, network threads stop reading from sockets. TCP receive buffers fill up. Eventually clients see <code>TimeoutException</code> — they get no response within <code>request.timeout.ms</code>. Metric to watch: <code>kafka.network:type=RequestChannel,name=RequestQueueSize</code>.</div>
+  </div>
+</div>
+
+<!-- Handling Sudden Influx -->
+<div class="section" id="influx">
+  <div class="section-header"><span class="section-icon">🌊</span><span class="section-title">How the Broker Handles Sudden Message Influx</span></div>
+
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">A traffic spike (e.g., a batch job suddenly producing 10x normal volume) exercises multiple Kafka subsystems. Here's what happens layer by layer:</p>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>TCP receive buffer absorbs initial burst</strong><br>OS buffers incoming TCP segments. Sized by <code>socket.receive.buffer.bytes</code>. Buys a few hundred milliseconds before clients see back-pressure.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>NetworkThreads parse and enqueue</strong><br>Parse incoming bytes into Request objects and enqueue to RequestQueue. Rate is limited by NIO throughput (~400K small requests/sec per thread).</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>IOThreads write to page cache (fast path)</strong><br>Writing to Kafka is a sequential append to the OS page cache. This is extremely fast — can sustain GB/s. The OS decides when to flush to disk (<code>log.flush.interval.ms</code>).</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>If acks=all: ProducePurgatory fills up</strong><br>Requests waiting for ISR acknowledgment pile up in purgatory. If ISR followers can't keep up, purgatory grows. If <code>max.in.flight.requests</code> is reached, producer blocks.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Followers experience fetch lag</strong><br>Followers fetch from leader. Under load, followers may lag behind. If lag exceeds <code>replica.lag.time.max.ms</code>, they're removed from ISR — which makes acks=all complete faster (fewer waiters) but reduces durability.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>RequestQueue hits limit (back-pressure)</strong><br>If IOThreads can't keep up, RequestQueue fills to <code>queued.max.requests</code>. NetworkThreads pause reading sockets. TCP buffers fill. Producer sees connection stall → <code>request.timeout.ms</code> fires → <code>TimeoutException</code> or retry.</div></div>
+    <div class="step"><div class="step-num">7</div><div class="step-body"><strong>OS background flush + disk I/O becomes bottleneck</strong><br>Eventually the OS flushes dirty pages to disk. If disk is slow (HDD, shared storage), flush can compete with serving reads from page cache. This is when you see read latency spike too.</div></div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>SRE mitigation strategies for traffic spikes:</strong><br>
+    1. <strong>Producer quotas:</strong> <code>producer_byte_rate</code> per client — throttle misbehaving producers before they saturate the broker.<br>
+    2. <strong>More IO threads:</strong> Increase <code>num.io.threads</code> if CPU/disk capacity exists.<br>
+    3. <strong>More partitions:</strong> Distributes load across more IOThread-level parallelism.<br>
+    4. <strong>Tiered storage:</strong> Offload old segments to object storage, freeing local disk I/O for active writes.<br>
+    5. <strong>Producer batching:</strong> Encourage producers to use larger <code>batch.size</code> and <code>linger.ms</code> — fewer, larger requests are cheaper for the broker.</div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>Metric to Monitor</th><th>What it Indicates</th><th>Threshold / Action</th></tr>
+    <tr><td><code>RequestQueueSize</code></td><td>Requests waiting for IO threads</td><td class="warn">&gt;100 → investigate; &gt;400 → critical</td></tr>
+    <tr><td><code>ProduceRequestQueueTimeMs</code></td><td>Time produce requests wait in queue</td><td class="warn">&gt;50ms → IO thread saturation</td></tr>
+    <tr><td><code>LocalTimeMs (Produce)</code></td><td>Time IO thread spends on disk write</td><td class="warn">&gt;20ms → disk bottleneck</td></tr>
+    <tr><td><code>RemoteTimeMs (Produce)</code></td><td>Time waiting for ISR acks (purgatory)</td><td class="warn">&gt;100ms → follower lag or ISR shrinkage</td></tr>
+    <tr><td><code>NetworkProcessorAvgIdlePercent</code></td><td>Network thread utilization</td><td class="danger">&lt;30% → add network threads</td></tr>
+    <tr><td><code>RequestHandlerAvgIdlePercent</code></td><td>IO thread utilization</td><td class="danger">&lt;30% → add IO threads or reduce load</td></tr>
+  </table>
+</div>
+
+<!-- Log Internals -->
+<div class="section" id="log-internals">
+  <div class="section-header"><span class="section-icon">📂</span><span class="section-title">Log Internals on Disk</span></div>
+
+  <div class="diagram">  /kafka-data/topic-orders/partition-0/
+  ├── 00000000000000000000.log        ← segment: actual message data
+  ├── 00000000000000000000.index      ← offset index: offset → physical position
+  ├── 00000000000000000000.timeindex  ← time index: timestamp → offset
+  ├── 00000000000012345678.log        ← older sealed segment
+  ├── 00000000000012345678.index
+  ├── 00000000000012345678.timeindex
+  ├── leader-epoch-checkpoint         ← leader epoch history (for truncation)
+  └── partition.metadata              ← topic ID (KRaft mode)
+
+  Segment filename = base offset (first message offset in that segment)
+
+  WITHIN A .log SEGMENT:
+  ┌──────────────────────────────────────────────────────┐
+  │ Record Batch Header                                   │
+  │   baseOffset, batchLength, magic byte, CRC           │
+  │   compression codec, timestamp type                  │
+  │   producerId, producerEpoch, sequence (idempotence)  │
+  │ Record 1: length, attributes, timestampDelta, key, value, headers
+  │ Record 2: ...                                        │
+  │ Record N: ...                                        │
+  └──────────────────────────────────────────────────────┘</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>.log file</h4>
+      <p>The actual data. Append-only. Records are grouped into <strong>Record Batches</strong>. The active segment is the only one being written to. All others are immutable.</p>
+    </div>
+    <div class="concept-card">
+      <h4>.index file (offset index)</h4>
+      <p>Sparse index mapping logical offsets → physical byte positions in the .log file. Enables O(log n) offset lookups — binary search the index, then sequential scan within the segment.</p>
+    </div>
+    <div class="concept-card">
+      <h4>.timeindex file</h4>
+      <p>Maps timestamps → offsets. Used for <code>offsetsForTimes()</code> API — consumers seeking to a specific point in time. Enables replaying from "yesterday 9am."</p>
+    </div>
+    <div class="concept-card">
+      <h4>Segment Rolling</h4>
+      <p>A new segment is created when the active segment exceeds <code>log.segment.bytes</code> (1 GB default) or <code>log.roll.hours</code> (168h). Sealed segments are eligible for retention/compaction.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Retention</h4>
+      <p>Broker periodically checks if segments can be deleted: <code>log.retention.bytes</code> (total size limit) or <code>log.retention.ms</code> (time-based, default 7 days). Only whole sealed segments are deleted.</p>
+    </div>
+    <div class="concept-card">
+      <h4>leader-epoch-checkpoint</h4>
+      <p>Records the starting offset for each leader epoch. Used by followers on recovery to truncate divergent entries — prevents data corruption after leader failover without needing full log comparison.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Page Cache & Zero-Copy -->
+<div class="section" id="page-cache">
+  <div class="section-header"><span class="section-icon">⚡</span><span class="section-title">Page Cache &amp; Zero-Copy</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Why Kafka Uses OS Page Cache</h4>
+      <p>Kafka never reads/writes disk directly — it writes to the OS page cache (kernel memory) and lets the OS flush to disk asynchronously. Benefits: <strong>automatic read-ahead</strong>, <strong>write coalescing</strong>, and data survives JVM restarts (stays in kernel memory).</p>
+    </div>
+    <div class="concept-card">
+      <h4>JVM Heap Sizing Implication</h4>
+      <p>Give Kafka brokers <strong>small JVM heap</strong> (4–8 GB) and let the rest of RAM be page cache. A 32 GB server should have 6 GB heap and 26 GB free for OS. Oversizing heap causes GC pressure and evicts page cache — hurts read performance.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Zero-Copy (Consumer Reads)</h4>
+      <p>When a consumer fetches data, the broker uses the <strong><code>sendfile()</code></strong> syscall: data transfers directly from page cache → network card via DMA, bypassing userspace entirely. Eliminates 2 data copies and 2 context switches per read.</p>
+    </div>
+    <div class="concept-card">
+      <h4>When Zero-Copy is NOT Used</h4>
+      <p>Zero-copy only works for <strong>uncompressed</strong> or <strong>same-codec</strong> data. If the broker must decompress-and-recompress (e.g., codec mismatch, or message format conversion), it goes through userspace — much slower. Keep producer and broker compression codecs aligned.</p>
+    </div>
+  </div>
+
+  <div class="diagram">  TRADITIONAL READ PATH (without zero-copy):
+  ┌────────────┐    read()    ┌──────────┐  copy  ┌──────────┐  write()  ┌────────┐
+  │ Disk/Cache │ ──────────► │ Kernel   │ ──────► │ Userspace│ ────────► │ Kernel │ → Network
+  └────────────┘             │ Buffer   │         │ Buffer   │           │ Socket │
+                             └──────────┘         └──────────┘           └────────┘
+                 4 copies, 4 context switches
+
+  KAFKA ZERO-COPY PATH (sendfile):
+  ┌────────────┐  sendfile()  ┌──────────────────────────────────────────────────┐
+  │ Page Cache │ ──────────► │         DMA transfer directly to NIC              │ → Network
+  └────────────┘             └──────────────────────────────────────────────────┘
+                 2 copies, 2 context switches — no userspace involvement</div>
+</div>
+
+<!-- Producer Lifecycle -->
+<div class="section" id="producer-lifecycle">
+  <div class="section-header"><span class="section-icon">📤</span><span class="section-title">Producer Lifecycle (Client Side)</span></div>
+
+  <div class="diagram">  Producer.send(record) call:
+  ─────────────────────────────────────────────────────────────
+  1. Serialize key/value (Serializer)
+  2. Determine partition:
+       - if key != null  → hash(key) % numPartitions (murmur2)
+       - if key == null  → sticky partitioner (fills one batch, then rotates)
+  3. Metadata lookup: is partition leader known? If not, fetch from broker.
+  4. Append to RecordAccumulator (in-memory batching buffer)
+       - Each TopicPartition has a Deque of ProducerBatch
+       - Batch fills up to batch.size (16KB default)
+  5. Sender thread (background) checks batches:
+       - Ready when: batch.size reached OR linger.ms elapsed
+       - Groups ready batches per broker → single ProduceRequest per broker
+  6. Sender sends ProduceRequest to leader broker
+  7. Waits for response (acks=1 → leader ack; acks=all → ISR ack)
+  8. On success: Future.get() returns RecordMetadata(offset, timestamp)
+  9. On failure: retry (up to retries count) with backoff (retry.backoff.ms)</div>
+
+  <table class="kv-table">
+    <tr><th>Producer Config</th><th>Role</th><th>Production Value</th></tr>
+    <tr><td><code>batch.size</code></td><td>Max bytes per batch per partition</td><td>65536–131072 (64–128KB) for high throughput</td></tr>
+    <tr><td><code>linger.ms</code></td><td>Wait time to fill a batch before sending</td><td>5–20ms for throughput; 0 for low latency</td></tr>
+    <tr><td><code>buffer.memory</code></td><td>Total RecordAccumulator memory</td><td>64–256MB depending on throughput</td></tr>
+    <tr><td><code>max.block.ms</code></td><td>How long send() blocks if buffer is full</td><td>60000ms default; tune to SLA</td></tr>
+    <tr><td><code>compression.type</code></td><td>Compress batches</td><td>lz4 (fast) or zstd (best ratio, Kafka 2.1+)</td></tr>
+    <tr><td><code>acks</code></td><td>Durability vs latency tradeoff</td><td>all for financial data; 1 for analytics</td></tr>
+    <tr><td><code>enable.idempotence</code></td><td>Deduplicate retries</td><td>true (default since Kafka 3.0)</td></tr>
+    <tr><td><code>max.in.flight.requests.per.connection</code></td><td>Concurrent unacked requests</td><td>5 with idempotence; 1 without (ordering)</td></tr>
+  </table>
+</div>
+
+<!-- Consumer Fetch Lifecycle -->
+<div class="section" id="consumer-lifecycle">
+  <div class="section-header"><span class="section-icon">📥</span><span class="section-title">Consumer Fetch Lifecycle</span></div>
+
+  <div class="diagram">  Consumer poll() call:
+  ─────────────────────────────────────────────────────────────
+  1. poll(timeout) called by application
+  2. ConsumerCoordinator: heartbeat check, rebalance if needed
+  3. Fetcher checks if cached records exist → return immediately if yes
+  4. If no cached records:
+       - Build FetchRequest per leader broker:
+           FetchRequest { partition=P0, fetchOffset=100,
+                          maxBytes=52428800,            ← fetch.max.bytes
+                          maxWaitMs=500,                ← fetch.max.wait.ms
+                          minBytes=1 }                  ← fetch.min.bytes
+  5. Broker receives FetchRequest:
+       - If data at offset 100 AND size >= minBytes → immediate response
+       - Else: park in FetchPurgatory until data arrives or maxWaitMs
+  6. Broker sends FetchResponse (zero-copy from page cache)
+  7. Fetcher deserializes records, applies interceptors
+  8. Returns ConsumerRecords to application
+  9. Application processes records
+  10. Commit offset (manual: commitSync/commitAsync; auto: every auto.commit.interval.ms)</div>
+
+  <table class="kv-table">
+    <tr><th>Consumer Config</th><th>Role</th><th>Tuning Guidance</th></tr>
+    <tr><td><code>fetch.min.bytes</code></td><td>Min data broker waits to accumulate before responding</td><td>1 (default, low latency); raise to 64KB+ for throughput</td></tr>
+    <tr><td><code>fetch.max.wait.ms</code></td><td>Max time broker waits if fetch.min.bytes not met</td><td>500ms default; lower for latency</td></tr>
+    <tr><td><code>max.partition.fetch.bytes</code></td><td>Max bytes fetched per partition per request</td><td>1MB default; must be &gt; max.message.bytes</td></tr>
+    <tr><td><code>fetch.max.bytes</code></td><td>Max total bytes per fetch response</td><td>50MB default; increase for high-throughput</td></tr>
+    <tr><td><code>max.poll.records</code></td><td>Max records returned per poll()</td><td>500 default; lower if processing is slow</td></tr>
+    <tr><td><code>max.poll.interval.ms</code></td><td>Max time between poll() calls before consumer is kicked</td><td>300000ms; increase if processing is slow</td></tr>
+    <tr><td><code>session.timeout.ms</code></td><td>Heartbeat timeout for group coordinator</td><td>45000ms; increase for long GC pauses</td></tr>
+    <tr><td><code>heartbeat.interval.ms</code></td><td>How often to send heartbeats</td><td>session.timeout.ms / 3</td></tr>
+  </table>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Architecture Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Why does Kafka use separate network threads and IO threads instead of one thread per connection?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        One-thread-per-connection (traditional Java IO model) doesn't scale beyond a few thousand connections — threads are expensive (1MB stack each) and context switching dominates CPU.
+        Kafka's NIO model: <strong>few NetworkThreads serve many connections</strong> via non-blocking selector (epoll/kqueue). A single NetworkThread handles 10,000+ idle connections.
+        IOThreads are separate because disk I/O can block — keeping them off the network path means a slow disk doesn't stall socket reads. This separation also allows tuning each pool independently to match hardware (e.g., 4 network threads for a 10G NIC, 16 IO threads for a 16-disk RAID array).
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A broker is logging "Request queue is full" errors. What's happening and how do you fix it?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        <strong>What's happening:</strong> IOThreads can't drain the RequestQueue fast enough — either they're CPU-bound, disk-bound, or blocked waiting for ISR acks in purgatory.
+        <ul>
+          <li><strong>Check RequestHandlerAvgIdlePercent:</strong> If &lt;30%, IO threads are saturated. First action: <code>num.io.threads</code>.</li>
+          <li><strong>Check RemoteTimeMs:</strong> High values mean produce requests are parked waiting for ISR acks — follower lag is the real bottleneck. Fix follower catching up (check <code>MaxLag</code> metric, network, disk on followers).</li>
+          <li><strong>Check disk I/O (<code>iostat</code>):</strong> If <code>%util</code> is 100%, add more disks or distribute log dirs with <code>log.dirs</code>.</li>
+          <li><strong>Short-term:</strong> Increase <code>queued.max.requests</code> to absorb burst — but this is a band-aid, not a fix.</li>
+          <li><strong>Apply producer quotas:</strong> <code>kafka-configs.sh --alter --add-config 'producer_byte_rate=10485760'</code> to throttle problematic clients.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How does Kafka guarantee message ordering within a partition despite producer retries?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Without idempotence, a producer sending records A → B could receive a timeout on A, retry, and end up with B → A on the broker if B was already accepted.
+        <br><br>
+        <strong>Idempotent producer</strong> solves this: the broker assigns each producer a <code>ProducerID (PID)</code> and tracks <code>sequenceNumber</code> per partition. If a batch arrives out of order or is duplicated, the broker detects it and either rejects (out-of-order) or deduplicates (duplicate). This is safe up to <code>max.in.flight.requests.per.connection=5</code> in-flight per connection — the broker validates sequence numbers for all 5 in-flight batches simultaneously.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Walk me through what happens when a broker crashes while a ProduceRequest is in purgatory.
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        1. The leader broker crashes. OS closes TCP connections. All in-flight requests are lost.<br>
+        2. Producer sees <code>ConnectionException</code> or timeout — triggers retry.<br>
+        3. Controller detects broker failure (ZK session expiry or KRaft heartbeat timeout). Triggers partition leader election for all partitions the failed broker led.<br>
+        4. New leader is elected from ISR. It already has all data the old leader had (because it was in-sync).<br>
+        5. Producer metadata refresh discovers the new leader.<br>
+        6. Producer retries the ProduceRequest to the new leader.<br>
+        7. With idempotence: broker deduplicates if the original request actually got written and replicated before the crash. Without idempotence: potential duplicate.<br>
+        <br>
+        <strong>Key edge case:</strong> If the original request was written to the leader's page cache but NOT flushed to disk AND not replicated to any follower before the crash, the data is lost — even with acks=all — because the leader dies before replication. This is why <code>min.insync.replicas=2</code> ensures at least one follower has confirmed before acking the producer.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

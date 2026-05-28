@@ -1,0 +1,9 @@
+# macOS metadata files
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# JPEG source images (not needed in the repo)
+*.jpeg
+*.jpg

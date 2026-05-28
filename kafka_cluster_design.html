@@ -1,0 +1,1297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Cluster Design | HSBC Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <div class="header-role">HSBC · Associate Director · Kafka SRE</div>
+      <h1>Kafka Platform Design</h1>
+      <p style="color:var(--text-muted);margin:0">End-to-end: sizing · replication · DR · observability · upgrades · HA · secrets</p>
+    </div>
+    <a href="index.html" class="btn-back">← Hub</a>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="toc">
+    <div class="toc-title">Contents</div>
+    <a href="#sizing">Cluster Sizing &amp; Hardware</a>
+    <a href="#replication">Replication, Rack Awareness &amp; ISR</a>
+    <a href="#partitions">Partition Count Strategy</a>
+    <a href="#retention">Retention Strategy</a>
+    <a href="#app-best-practices">Producer &amp; Consumer Best Practices</a>
+    <a href="#dr">DR Solution &amp; Failover</a>
+    <a href="#observability">Observability Stack</a>
+    <a href="#patching">OS Patching &amp; Kafka Upgrades</a>
+    <a href="#version">Version Selection</a>
+    <a href="#infra-tooling">Infra &amp; Platform Tooling</a>
+    <a href="#secrets">Password &amp; Certificate Rotation</a>
+    <a href="#ha-components">HA for Platform Components</a>
+  </nav>
+
+  <main>
+
+    <!-- Cluster Sizing -->
+    <section id="sizing">
+      <h2>Cluster Sizing &amp; Hardware</h2>
+
+      <div class="concept-card">
+        <h3>The Sizing Decision Tree</h3>
+        <div class="diagram">
+          <b>Step 1 — Quantify your workload</b>
+          <pre>
+Key inputs to gather from application teams:
+  P = peak message rate (msg/s)     → get this with 2× headroom
+  S = average message size (bytes)
+  RF = replication factor (default: 3)
+  R = retention period (days)
+  C = number of consumer groups reading each topic
+  BW_NIC = network interface capacity per broker
+
+Producer throughput per broker (inbound):
+  T_in = P × S   (bytes/sec total ingested)
+
+Replication traffic adds (RF−1) copies:
+  T_replication = T_in × (RF − 1)
+
+Consumer fetch traffic (assume C consumer groups):
+  T_out = T_in × C
+
+Total per-broker network:
+  T_total = T_in + T_replication + T_out
+  → Target: T_total ≤ 60% of NIC capacity
+  → If 10GbE (1,200 MB/s), safe limit ≈ 720 MB/s per broker
+          </pre>
+          <b>Step 2 — Minimum broker count for network</b>
+          <pre>
+brokers_net = ceil(T_total / (0.6 × BW_NIC))
+
+Example:
+  P=500K msg/s, S=2KB, RF=3, C=5 consumer groups
+  T_in         = 500K × 2KB    = 1,000 MB/s
+  T_replication= 1,000 × 2     = 2,000 MB/s
+  T_out        = 1,000 × 5     = 5,000 MB/s
+  T_total      = 8,000 MB/s
+  brokers_net  = ceil(8,000 / 720) = 12 brokers
+          </pre>
+          <b>Step 3 — Disk capacity per broker</b>
+          <pre>
+disk_total = T_in × retention_seconds × RF
+disk_per_broker = disk_total / num_brokers + 20% headroom
+
+Example (7-day retention, 12 brokers):
+  disk_total    = 1,000 MB/s × 604,800s × 3 = 1.8 PB
+  disk_per_broker = 1.8PB / 12 + 20%        = 180 TB
+
+→ Use JBOD: 12 × 16TB NVMe per broker = 192TB ✓
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Broker Hardware Specification</h3>
+        <table class="kv-table">
+          <thead><tr><th>Resource</th><th>Small Cluster<br/>(≤50 MB/s/broker)</th><th>Medium Cluster<br/>(≤200 MB/s/broker)</th><th>Large Cluster<br/>(≤600 MB/s/broker)</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>CPU</td>
+              <td>16 vCPU</td>
+              <td>32 vCPU</td>
+              <td>64 vCPU (physical preferred)</td>
+            </tr>
+            <tr>
+              <td>RAM</td>
+              <td>64 GB<br/><small>(JVM 6 GB, rest = page cache)</small></td>
+              <td>128 GB</td>
+              <td>256 GB</td>
+            </tr>
+            <tr>
+              <td>Kafka JVM Heap</td>
+              <td>4–6 GB</td>
+              <td>6 GB</td>
+              <td>6 GB (never exceed 8 GB — G1GC)</td>
+            </tr>
+            <tr>
+              <td>Page Cache</td>
+              <td>~56 GB</td>
+              <td>~120 GB</td>
+              <td>~248 GB — the real throughput driver</td>
+            </tr>
+            <tr>
+              <td>Disk</td>
+              <td>4× 2TB NVMe (JBOD)</td>
+              <td>8× 4TB NVMe (JBOD)</td>
+              <td>12–16× 8TB NVMe (JBOD)</td>
+            </tr>
+            <tr>
+              <td>Network</td>
+              <td>10 GbE</td>
+              <td>25 GbE</td>
+              <td>2× 25 GbE bonded</td>
+            </tr>
+            <tr>
+              <td>OS filesystem</td>
+              <td colspan="3">XFS (preferred) or ext4. Never NFS. Mount with <code>noatime</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout warn">
+          <strong>JVM heap ≠ more performance.</strong> Kafka's read/write performance comes from the OS page cache, not the JVM heap. Oversizing heap (e.g. 32 GB) leaves less RAM for page cache, causes longer GC pauses, and degrades throughput. Keep heap at 6 GB and give the rest to the OS.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>JBOD vs RAID for Kafka</h3>
+        <table class="kv-table">
+          <thead><tr><th>Aspect</th><th>JBOD (Just a Bunch Of Disks)</th><th>RAID-10</th></tr></thead>
+          <tbody>
+            <tr><td>Kafka support</td><td>Native via <code>log.dirs=/data1,/data2,/data3</code></td><td>Single <code>log.dirs</code> path</td></tr>
+            <tr><td>Single disk failure</td><td>Only partitions on that disk go offline; broker stays up. Replicas on other brokers cover the gap.</td><td>RAID controller handles it; no Kafka impact if mirror disk is healthy.</td></tr>
+            <tr><td>Write throughput</td><td>Linear with disk count (parallel writes across disks)</td><td>RAID-10: 50% capacity penalty, write amplification</td></tr>
+            <tr><td>Recommendation</td><td><strong>Preferred for Kafka</strong> — Kafka's replication IS your redundancy. JBOD maximises usable capacity and throughput.</td><td>Unnecessary given RF≥3. Double-paying for redundancy.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Cluster Topology: VMs vs Kubernetes vs Cloud-Managed</h3>
+        <table class="kv-table">
+          <thead><tr><th>Deployment Model</th><th>Best For</th><th>Trade-offs</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Bare-metal / dedicated VMs</td>
+              <td>Highest throughput, predictable latency, large-scale financial workloads (HSBC use case)</td>
+              <td>High ops burden. Hardware lifecycle management. Full control over JVM, OS, disk I/O.</td>
+            </tr>
+            <tr>
+              <td>Kubernetes (Strimzi)</td>
+              <td>Platform teams with K8s expertise. Dev/staging clusters. GitOps-driven operations.</td>
+              <td>I/O scheduling overhead. Network hop for storage (if not local PVs). Excellent for ops automation.</td>
+            </tr>
+            <tr>
+              <td>AWS MSK</td>
+              <td>AWS-native orgs, rapid provisioning, reduced ops burden</td>
+              <td>Limited config control. More expensive than self-managed at scale. ZK still required on older versions.</td>
+            </tr>
+            <tr>
+              <td>Confluent Cloud</td>
+              <td>Lowest ops burden, full ecosystem (SR, Connect, ksqlDB included)</td>
+              <td>Highest cost. Data residency constraints. Limited config tuning.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Replication, Rack Awareness, min.ISR -->
+    <section id="replication">
+      <h2>Replication, Rack Awareness, min.ISR, RPO &amp; RTO</h2>
+
+      <div class="concept-card">
+        <h3>Replication Factor Decision</h3>
+        <table class="kv-table">
+          <thead><tr><th>RF</th><th>Broker Failures Tolerated</th><th>Use Case</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>0</td><td>Never in production. Only scratch/test topics.</td><td>1× storage</td></tr>
+            <tr><td>2</td><td>0 (1 can be lost if it's not the only ISR)</td><td>Acceptable only for non-critical, high-volume analytics topics where some loss is OK.</td><td>2× storage</td></tr>
+            <tr><td><strong>3</strong></td><td><strong>1</strong></td><td><strong>Production standard.</strong> Survives 1 broker failure with min.ISR=2 and no data loss.</td><td>3× storage</td></tr>
+            <tr><td>5</td><td>2</td><td>Mission-critical topics (e.g. payments audit log). Rarely needed if cluster is healthy.</td><td>5× storage</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <strong>Rule:</strong> RF=3 + min.ISR=2 is the universal production standard. The only valid reason to go to RF=5 is regulatory data durability requirements (e.g., cannot lose any payment record under any 2-fault scenario).
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Rack-Aware Replica Placement</h3>
+        <div class="diagram">
+          <b>Without rack awareness (3 brokers, same rack/AZ)</b>
+          <pre>
+Topic: payments, RF=3
+  Partition 0: Leader=Broker1(AZ-A), Replica=Broker2(AZ-A), Replica=Broker3(AZ-A)
+
+AZ-A failure → ALL replicas lost → partition OFFLINE → data loss possible
+          </pre>
+          <b>With rack awareness (broker.rack = AZ label)</b>
+          <pre>
+# broker.rack in server.properties:
+broker.rack=us-east-1a   (Broker 1, 2)
+broker.rack=us-east-1b   (Broker 3, 4)
+broker.rack=us-east-1c   (Broker 5, 6)
+
+Topic: payments, RF=3
+  Partition 0: Leader=Broker1(AZ-A), Replica=Broker3(AZ-B), Replica=Broker5(AZ-C)
+  Partition 1: Leader=Broker3(AZ-B), Replica=Broker5(AZ-C), Replica=Broker2(AZ-A)
+
+AZ-A failure → Broker3 or Broker5 elected leader → partition STAYS ONLINE ✓
+AZ-B failure → still 2 replicas alive (AZ-A + AZ-C) → ISR=2 ≥ min.ISR ✓
+          </pre>
+        </div>
+
+        <div class="diagram">
+          <b>How rack-aware assignment works</b>
+          <pre>
+Kafka's rack-aware algorithm (kafka-topics.sh --create):
+  1. Sort brokers, interleave by rack: A1, B1, C1, A2, B2, C2, ...
+  2. For each partition, assign leader to next broker in the list
+  3. Assign RF-1 replicas to the NEXT RF-1 brokers in the interleaved list
+  → Guarantees each AZ gets exactly 1 replica per partition (when RF = AZ count)
+
+Verify placement:
+  kafka-topics.sh --describe --topic payments --bootstrap-server :9092
+  # Check Replicas and Isr columns — IDs should span different rack groups
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>min.insync.replicas and the Availability vs Durability Tradeoff</h3>
+        <div class="diagram">
+          <pre>
+Configuration pairing:
+  acks=all + min.insync.replicas=2 + replication.factor=3
+
+What this means:
+  Producer write is only ACK'd after 2 of 3 replicas have persisted it.
+  If only 1 replica is in-sync, the broker returns NOT_ENOUGH_REPLICAS error.
+  Producer retries → write waits until a second broker recovers.
+
+Scenarios:
+  All 3 up:  ISR={1,2,3} → writes proceed, can lose 1 broker with 0 data loss
+  1 down:    ISR={1,2}   → writes proceed (2 ≥ min.ISR=2), 1 more failure = stall
+  2 down:    ISR={1}     → writes BLOCKED (1 < min.ISR=2) → producer gets error
+             ↑ This is AVAILABILITY sacrificed to guarantee DURABILITY
+
+Tuning for different topics:
+  Topic type               min.ISR  acks  Tradeoff
+  ─────────────────────────────────────────────────
+  Payments, audit (PCI)      2       all  Durability over availability
+  Notifications, alerts      1       1    Availability over durability
+  Analytics (can replay)     1       1    Maximum throughput
+  Exactly-once transactions  2       all  Required for EOS
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>RPO &amp; RTO with Different Configurations</h3>
+        <table class="kv-table">
+          <thead><tr><th>Scenario</th><th>Config</th><th>RPO (data loss)</th><th>RTO (recovery time)</th></tr></thead>
+          <tbody>
+            <tr><td>Single broker failure, RF=3, min.ISR=2, acks=all</td><td>KRaft</td><td><strong>0</strong> — all writes were on ≥2 brokers</td><td>&lt;1 second (KRaft leader election)</td></tr>
+            <tr><td>Single broker failure, RF=3, min.ISR=2, acks=all</td><td>ZooKeeper</td><td><strong>0</strong></td><td>6–30 seconds (ZK session timeout)</td></tr>
+            <tr><td>AZ failure (1 of 3), rack-aware RF=3</td><td>KRaft</td><td>0 — ISR=2 still met on surviving AZs</td><td>&lt;5 seconds — leaders re-elected</td></tr>
+            <tr><td>Full DC failure, MM2 active-passive DR</td><td>Any</td><td>~60 seconds (MM2 offset sync interval)</td><td>15–30 min (operator-executed failover)</td></tr>
+            <tr><td>Full DC failure, synchronous cross-DC replication</td><td>Stretch cluster</td><td>0</td><td>&lt;1 min (automatic) — but cross-DC latency impacts P99</td></tr>
+            <tr><td>Data corruption / accidental delete</td><td>Any + S3 backup</td><td>Last S3 flush (minutes to hours)</td><td>Hours (replay from S3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Partition Count -->
+    <section id="partitions">
+      <h2>Partition Count Strategy</h2>
+
+      <div class="concept-card">
+        <h3>Why Partitions Matter</h3>
+        <ul class="checklist">
+          <li><strong>Parallelism unit:</strong> A consumer group can have at most as many active consumers as there are partitions. Too few partitions = consumers idle.</li>
+          <li><strong>Throughput unit:</strong> Each partition can sustain ~10–100 MB/s depending on disk type. More partitions = more parallelism = more total throughput.</li>
+          <li><strong>Ordering unit:</strong> Kafka guarantees order within a partition only. If strict global ordering is required, you must use 1 partition (at the cost of all parallelism).</li>
+          <li><strong>Irreversible increase:</strong> Partitions can only be increased, never decreased. Adding partitions redistributes which keys go to which partition, breaking any key-based ordering guarantee.</li>
+        </ul>
+      </div>
+
+      <div class="concept-card">
+        <h3>Partition Sizing Formula</h3>
+        <div class="diagram">
+          <pre>
+Formula:
+  partitions = max(
+    ceil(target_producer_throughput / throughput_per_partition),
+    ceil(target_consumer_throughput / throughput_per_partition),
+    desired_consumer_parallelism
+  )
+
+Throughput per partition benchmark (rule of thumb):
+  NVMe SSD:           50–100 MB/s per partition
+  SAS/SATA SSD:       20–50 MB/s per partition
+  Spinning disk HDD:  5–10 MB/s per partition
+
+Example:
+  Payments topic:
+    Producer rate:     200 MB/s
+    Consumer groups:   3 (fraud, accounting, audit)
+    Max consumer rate: 100 MB/s per group
+    Desired consumers per group: 12
+
+  Throughput: ceil(200/50) = 4 partitions — insufficient
+  Consumer parallelism: 12 per group
+  Final: max(4, 12) = 12 partitions
+
+  Round to a multiple that divides evenly by consumer count
+  and is a round number: 12 or 24 ✓
+          </pre>
+        </div>
+
+        <div class="callout warn">
+          <strong>Over-partitioning costs:</strong> Each partition = a file descriptor on disk + 1 thread in the leader epoch tracker + memory for replication state. A broker with 10,000 partitions as leader may need 2–3 GB heap just for partition metadata. Confluent recommends max 4,000 partitions per broker as a practical ceiling (ZK). KRaft raises this to millions.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Partition Count Rules of Thumb</h3>
+        <table class="kv-table">
+          <thead><tr><th>Guideline</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>Start conservatively (12–24 per topic). You can always increase.</td><td>Partition count is one-way. It's easier to add than to deal with key distribution changing after an increase.</td></tr>
+            <tr><td>Partition count should be a multiple of the number of consumers AND the number of brokers.</td><td>Ensures even distribution. E.g., 6 brokers + 12 consumers → 24 partitions (24/6=4 per broker, 24/12=2 per consumer).</td></tr>
+            <tr><td>If order matters within a logical group, ensure messages with the same key go to the same partition. Don't change partition count after keys are in use.</td><td>Kafka's default partitioner uses <code>hash(key) % numPartitions</code>. Changing numPartitions changes hash targets → ordering broken for existing keys.</td></tr>
+            <tr><td>For compacted topics, keep partition count moderate (12–48). Don't over-partition compacted topics.</td><td>Compaction runs per partition. Too many small partitions → more compaction threads → more resource overhead per broker.</td></tr>
+            <tr><td>Global aggregate: aim for &lt;4,000 partitions per broker (ZK mode), &lt;50,000 (KRaft mode).</td><td>Controller overhead scales with total partition count. ZK chokes above ~200K cluster-wide.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Retention -->
+    <section id="retention">
+      <h2>Retention Strategy</h2>
+
+      <div class="concept-card">
+        <h3>Retention Configuration Decision</h3>
+        <div class="diagram">
+          <pre>
+Three axes of retention:
+  1. Time:  log.retention.ms      (default: 7 days = 604800000)
+  2. Size:  log.retention.bytes   (default: -1 = unlimited per partition)
+  3. Both:  Kafka deletes segments that violate EITHER condition
+
+Compaction:
+  cleanup.policy=compact → keep only last value per key (tombstone = null)
+  cleanup.policy=delete,compact → both (compact + time/size delete)
+
+Per-topic override (always prefer per-topic over cluster defaults):
+  kafka-configs.sh --bootstrap-server :9092 \
+    --entity-type topics --entity-name payments.v1 --alter \
+    --add-config 'retention.ms=604800000,retention.bytes=107374182400'
+          </pre>
+        </div>
+
+        <table class="kv-table">
+          <thead><tr><th>Topic Category</th><th>Retention Policy</th><th>Rationale</th></tr></thead>
+          <tbody>
+            <tr><td>Payments / financial transactions</td><td>7 days time + unlimited size. Archive to S3 via S3 Sink for 7 years.</td><td>Regulatory: PCI-DSS / data retention laws require long-term storage. Kafka is the hot layer; S3 is cold archive.</td></tr>
+            <tr><td>CDC (Debezium database changes)</td><td><code>cleanup.policy=compact</code> — keep latest state per key.</td><td>Consumers that restart late can reconstruct current state from compacted topic without needing full history.</td></tr>
+            <tr><td>Application events (notifications, emails)</td><td>3–7 days delete</td><td>Long enough for consumers to recover from outages. No long-term value.</td></tr>
+            <tr><td>Analytics / data pipeline</td><td>1–3 days. Sink to data warehouse via Kafka Connect.</td><td>High volume. Data lands in warehouse; Kafka is transit, not storage.</td></tr>
+            <tr><td>Audit logs</td><td>30 days time + compact. Long-term: S3 or WORM storage.</td><td>Audit trails need immutability and long retention. Kafka + S3 Sink + S3 Object Lock.</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <strong>Tiered Storage (Kafka 3.6+):</strong> Set <code>log.local.retention.ms=86400000</code> (1 day local) and <code>log.retention.ms=2592000000</code> (30 days total). Kafka keeps 1 day hot on disk, automatically offloads older segments to S3/GCS. Consumers can still fetch from remote storage transparently. Drastically reduces local disk requirements for long-retention topics.
+        </div>
+      </div>
+    </section>
+
+    <!-- Producer & Consumer Best Practices -->
+    <section id="app-best-practices">
+      <h2>Producer &amp; Consumer Best Practices</h2>
+
+      <div class="concept-card">
+        <h3>Producer Best Practices</h3>
+        <table class="kv-table">
+          <thead><tr><th>Practice</th><th>Configuration / Code</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Always use <code>acks=all</code> for critical data</td>
+              <td><code>acks=all</code></td>
+              <td>Ensures the write is on all min.ISR replicas before ACK. Prevents data loss on broker crash.</td>
+            </tr>
+            <tr>
+              <td>Enable idempotent producer</td>
+              <td><code>enable.idempotence=true</code> (implied by acks=all + retries&gt;0 in modern clients)</td>
+              <td>Assigns PID + sequence number per partition. Broker deduplicates retried messages. Exactly-once on the produce side.</td>
+            </tr>
+            <tr>
+              <td>Tune batch size and linger</td>
+              <td><code>batch.size=65536</code> (64KB), <code>linger.ms=20</code></td>
+              <td>linger.ms=0 (default) sends immediately — tiny batches, terrible throughput. 20ms allows batching without visible latency impact for most use cases.</td>
+            </tr>
+            <tr>
+              <td>Enable compression</td>
+              <td><code>compression.type=lz4</code> (balanced) or <code>zstd</code> (high ratio)</td>
+              <td>Reduces network and disk I/O. CPU cost is usually worth it. lz4 is fastest; zstd best compression ratio.</td>
+            </tr>
+            <tr>
+              <td>Size buffer.memory appropriately</td>
+              <td><code>buffer.memory=134217728</code> (128MB) for high-throughput</td>
+              <td>If buffer is full, <code>send()</code> blocks for <code>max.block.ms</code> (60s default). Set buffer large enough to absorb broker slowdowns.</td>
+            </tr>
+            <tr>
+              <td>Set retry budget with backoff</td>
+              <td><code>retries=Integer.MAX_VALUE</code>, <code>retry.backoff.ms=100</code>, <code>delivery.timeout.ms=120000</code></td>
+              <td>Retries must stay bounded. delivery.timeout.ms is the total time budget. Infinite retries within a delivery window = effectively "keep trying for 2 min".</td>
+            </tr>
+            <tr>
+              <td>Never catch and swallow send callbacks</td>
+              <td>Always check <code>RecordMetadata</code> and <code>Exception</code> in callback</td>
+              <td>Silent discard of send errors causes data loss with no visibility. Always log or alert on send failures.</td>
+            </tr>
+            <tr>
+              <td>Use Schema Registry for all topics</td>
+              <td>Avro or Protobuf serializers with SR URL</td>
+              <td>Decouples schema from message. Enables schema evolution without breaking consumers. Prevents serialization bugs going to production.</td>
+            </tr>
+            <tr>
+              <td>Choose meaningful partition keys</td>
+              <td>E.g., <code>customerId</code> or <code>orderId</code>, not random UUID</td>
+              <td>Key determines partition → ordering and co-location of related events. Hot partitions occur if key cardinality is low (e.g., country code). Use key+secondary if cardinality is low.</td>
+            </tr>
+            <tr>
+              <td>Avoid synchronous sends in latency-sensitive paths</td>
+              <td>Use async send with callback, not <code>future.get()</code></td>
+              <td><code>future.get()</code> blocks until ACK — one message at a time. Async allows pipelining of up to <code>max.in.flight.requests.per.connection</code> (5) batches.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Consumer Best Practices</h3>
+        <table class="kv-table">
+          <thead><tr><th>Practice</th><th>Configuration / Code</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Disable auto-commit; commit manually after processing</td>
+              <td><code>enable.auto.commit=false</code>; call <code>consumer.commitSync()</code> after processing batch</td>
+              <td>Auto-commit can commit offsets before processing is complete, causing data loss on crash. Manual commit ensures at-least-once semantics.</td>
+            </tr>
+            <tr>
+              <td>Design for idempotent processing</td>
+              <td>Use database upsert, deduplication by message ID, or external idempotency key store</td>
+              <td>At-least-once delivery means duplicates will occur (rebalance, crash). Idempotent consumers make duplicates harmless.</td>
+            </tr>
+            <tr>
+              <td>Use cooperative-sticky rebalance assignor</td>
+              <td><code>partition.assignment.strategy=CooperativeStickyAssignor</code></td>
+              <td>Eager (default) rebalance revokes ALL partitions from ALL consumers, causing lag spike. Cooperative rebalance only moves partitions that need to change. Critical for high-partition-count topics.</td>
+            </tr>
+            <tr>
+              <td>Tune max.poll.interval.ms to match processing time</td>
+              <td><code>max.poll.interval.ms=600000</code> (10 min) for slow processors</td>
+              <td>If poll() is not called within this interval, the consumer is kicked from the group. Set to 2× worst-case processing time for a full batch.</td>
+            </tr>
+            <tr>
+              <td>Control batch size with max.poll.records</td>
+              <td><code>max.poll.records=500</code> (default 500; reduce for slow processors)</td>
+              <td>If processing 500 records takes longer than max.poll.interval.ms, reduce records per poll so the consumer can heartbeat between batches.</td>
+            </tr>
+            <tr>
+              <td>Separate heartbeat thread from processing thread</td>
+              <td>This is built into modern Kafka clients (Java 2.x+): heartbeat runs on a background thread</td>
+              <td>Old clients (0.x) had single-threaded poll → long processing = missed heartbeat. Modern clients handle this, but you still must call poll() regularly to trigger rebalance notifications.</td>
+            </tr>
+            <tr>
+              <td>Handle deserialization failures with a DLQ</td>
+              <td>Try/catch DeserializationException, produce to <code>topicname.dlq</code> with original bytes + headers</td>
+              <td>A single bad message can halt the entire partition if not handled. DLQ allows the pipeline to continue and investigate errors separately.</td>
+            </tr>
+            <tr>
+              <td>Monitor lag as a health metric, not throughput</td>
+              <td>Alert on growing lag (rate &gt; 0), not just lag magnitude</td>
+              <td>A consumer with lag=10,000 is fine if it's stable. A consumer with lag=100 that's growing is the alert. Use Burrow or kminion for STALLED state detection.</td>
+            </tr>
+            <tr>
+              <td>Set isolation.level=read_committed for transactional topics</td>
+              <td><code>isolation.level=read_committed</code></td>
+              <td>Without this, consumers read uncommitted transactional messages (including aborted ones). Essential if consuming from a topic written by a transactional producer.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- DR Solution -->
+    <section id="dr">
+      <h2>DR Solution &amp; Primary/DR Flip</h2>
+
+      <div class="concept-card">
+        <h3>DR Architecture with MirrorMaker 2</h3>
+        <div class="diagram">
+          <b>Active-Passive Topology (recommended for most cases)</b>
+          <pre>
+                    ┌─────────────────────────────────┐
+  Applications ────▶│   PRIMARY (DC-A / AZ: 3 zones)  │
+  (Read/Write)      │   6 brokers, RF=3, rack-aware    │
+                    └─────────────┬───────────────────┘
+                                  │ MirrorMaker 2
+                                  │ Replicates: topics + consumer offsets + ACLs
+                                  ▼
+                    ┌─────────────────────────────────┐
+                    │   DR (DC-B / separate region)    │
+                    │   6 brokers, RF=3, rack-aware    │
+                    │   Topics prefixed: dc-a.*        │
+                    └─────────────────────────────────┘
+
+MirrorMaker 2 runs in DC-B (consumes from DC-A, writes locally).
+Runs as Kafka Connect cluster (distributed mode, 3+ workers) for HA.
+          </pre>
+          <b>Active-Active Topology (bidirectional)</b>
+          <pre>
+  DC-A ←──── MM2 ─────▶ DC-B
+
+  DC-A topics: dc-b.events (mirrored FROM DC-B)
+  DC-B topics: dc-a.events (mirrored FROM DC-A)
+
+  Use case: geo-distributed producers in both DCs.
+  Challenge: consumers must read from both sets of topics and deduplicate.
+  Complexity: high. Avoid unless truly required.
+          </pre>
+        </div>
+
+        <div class="callout info">
+          <strong>Offset sync:</strong> MM2 syncs consumer group offsets every 60s by default (<code>sync.group.offsets.interval.seconds=60</code>). Reduce to 10s for lower RPO. The last ~10s of messages before failover may be replayed — all consumers must be idempotent.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>How to Flip Primary and DR Sides</h3>
+        <ol class="step-list">
+          <li>
+            <strong>Pre-conditions before the flip</strong>
+            <p>MM2 replication lag should be near-zero. Verify with <code>kafka-consumer-groups.sh --describe --group mm2-...</code> on the DR cluster — lag should be &lt;1000 records. DR cluster health: URP=0, all brokers running.</p>
+          </li>
+          <li>
+            <strong>Planned failover (maintenance window) — stop producers on DC-A</strong>
+            <div class="diagram"><pre>
+# Signal applications to stop writing to DC-A
+# OR: change load balancer routing weight to 0 for DC-A endpoint
+# Wait until MM2 lag reaches 0 (all data replicated):
+kafka-consumer-groups.sh --bootstrap-server dc-b:9092 \
+  --describe --group mm2-dc-a-to-dc-b
+# Lag column should be 0 for all partitions
+            </pre></div>
+          </li>
+          <li>
+            <strong>Translate consumer offsets</strong>
+            <div class="diagram"><pre>
+# MM2 has synced offsets automatically. Verify with:
+kafka-consumer-groups.sh --bootstrap-server dc-b:9092 \
+  --describe --group your-consumer-group
+# Should show correct offsets under dc-a.* topic names
+
+# If using IdentityReplicationPolicy (no topic prefix):
+# Consumers will resume at same offsets after DNS update
+            </pre></div>
+          </li>
+          <li>
+            <strong>Switch DNS / Load Balancer to DC-B</strong>
+            <p>Update <code>bootstrap.servers</code> DNS record from DC-A brokers to DC-B brokers. Use short TTL (30s) for fast propagation. Alternatively use a virtual IP or service mesh endpoint.</p>
+          </li>
+          <li>
+            <strong>Validate on DC-B</strong>
+            <p>Monitor consumer lag on DC-B. Confirm producers are writing to DC-B. Confirm consumers are reading from DC-B with correct offsets. Check URPs = 0.</p>
+          </li>
+          <li>
+            <strong>Reverse MM2 (DC-B → DC-A)</strong>
+            <p>Once DC-B is confirmed primary, set up a new MM2 replication job: DC-B → DC-A. This allows failback when DC-A recovers. Prevents DC-A from going stale if it's needed again.</p>
+          </li>
+          <li>
+            <strong>Failback (when DC-A is healthy)</strong>
+            <div class="diagram"><pre>
+Failback is the same procedure in reverse:
+  1. Ensure DC-B → DC-A MM2 lag ≈ 0
+  2. Stop producers on DC-B
+  3. Wait for full sync
+  4. Translate offsets (or use synced offsets)
+  5. Switch DNS back to DC-A
+  6. Re-establish DC-A → DC-B MM2 replication
+            </pre></div>
+          </li>
+        </ol>
+
+        <div class="callout danger">
+          <strong>Split-brain risk during flip:</strong> Between steps 2 and 4, no producers should write to EITHER cluster. If applications auto-reconnect before DNS propagates, you may get writes to both clusters that are never merged. Use an application-level "maintenance mode" flag or circuit breaker to hold producers during the DNS TTL window.
+        </div>
+      </div>
+    </section>
+
+    <!-- Observability Stack -->
+    <section id="observability">
+      <h2>Observability Stack</h2>
+
+      <div class="concept-card">
+        <h3>Full Observability Architecture</h3>
+        <div class="diagram">
+          <pre>
+┌─────────────────────────────────────────────────────────────────┐
+│  Kafka Brokers / Connect / Schema Registry / ksqlDB             │
+│    JMX (port 9999)                                              │
+└───────────────┬─────────────────────────────────────────────────┘
+                │ JMX Exporter (Java agent, port 7071)
+                ▼
+┌──────────────────────────┐    ┌──────────────────────────────┐
+│  Prometheus               │    │  Burrow / kminion            │
+│  scrape interval: 30s     │    │  Consumer lag tracking       │
+│  retention: 30d (Thanos)  │    │  STALLED group detection     │
+└──────────┬───────────────┘    └──────────────┬───────────────┘
+           │                                   │
+           ▼                                   │
+┌──────────────────────────┐                   │
+│  Alertmanager             │◀──────────────────┘
+│  PagerDuty (P1/P2)        │
+│  Slack (P3/Info)          │
+└──────────┬───────────────┘
+           │
+           ▼
+┌──────────────────────────┐    ┌──────────────────────────────┐
+│  Grafana                  │    │  ELK / Loki (log aggregation)│
+│  6+ dashboards            │    │  Broker logs, GC logs        │
+│  Dashboard IDs: 7589,     │    │  Alerts on ERROR patterns    │
+│  10973, 721               │    └──────────────────────────────┘
+└──────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Distributed Tracing (optional for high-maturity)                │
+│  Inject trace ID in Kafka message headers (X-Trace-Id)           │
+│  Propagate through producer → broker → consumer                  │
+│  Visualize end-to-end latency in Jaeger/Tempo                    │
+└──────────────────────────────────────────────────────────────────┘
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Must-Have Alert Rules</h3>
+        <table class="kv-table">
+          <thead><tr><th>Alert</th><th>Condition</th><th>Severity</th><th>Response</th></tr></thead>
+          <tbody>
+            <tr><td>OfflinePartitions</td><td><code>kafka_controller_kafkacontroller_offlinepartitionscount &gt; 0</code></td><td>P1 — Page immediately</td><td>Runbook: OfflinePartitionsCount</td></tr>
+            <tr><td>ActiveControllerCount</td><td><code>sum(kafka_controller_active) != 1</code></td><td>P1</td><td>0 = no controller elected. 2+ = split-brain. Both are emergencies.</td></tr>
+            <tr><td>UnderReplicatedPartitions</td><td><code>kafka_server_replicamanager_underreplicatedpartitions &gt; 0 for 1m</code></td><td>P2</td><td>Runbook: URP spike</td></tr>
+            <tr><td>ConsumerLagGrowing</td><td><code>rate(consumer_lag[10m]) &gt; 100</code></td><td>P2</td><td>Investigate consumer health, scale out if needed</td></tr>
+            <tr><td>BrokerDiskUsage</td><td><code>disk_used_percent &gt; 75</code></td><td>P2</td><td>Reduce retention or expand disk</td></tr>
+            <tr><td>RequestHandlerIdleLow</td><td><code>RequestHandlerAvgIdlePercent &lt; 0.2</code></td><td>P2</td><td>Increase num.io.threads or add brokers</td></tr>
+            <tr><td>BrokerGCPause</td><td><code>jvm_gc_pause_seconds_max &gt; 1</code></td><td>P3</td><td>Tune G1GC settings</td></tr>
+            <tr><td>MM2 Replication Lag</td><td><code>mm2_consumer_lag &gt; 100000 for 5m</code></td><td>P2</td><td>Check MM2 worker health, source cluster availability</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Log Aggregation for Kafka</h3>
+        <div class="diagram"><pre>
+Broker log4j config (log4j.properties):
+  log4j.appender.kafkaAppender.File=/var/log/kafka/server.log
+  log4j.appender.kafkaAppender.MaxFileSize=100MB
+  log4j.appender.kafkaAppender.MaxBackupIndex=10
+
+Log shipping (choose one):
+  - Filebeat → Logstash → Elasticsearch (ELK)
+  - Promtail → Loki → Grafana (lighter weight)
+  - Fluentd → OpenSearch
+
+Critical log patterns to alert on:
+  Pattern                                     Meaning
+  ─────────────────────────────────────────────────────
+  "ERROR.*not enough replicas"                min.ISR violation
+  "WARN.*Leader not local"                    partition leadership issue
+  "ERROR.*IOException"                        disk problem
+  "INFO.*Coordinator.*Expired"                consumer group session timeout
+  "ERROR.*OutOfMemoryError"                   JVM OOM → crash imminent
+  "WARN.*Request.*expired.*in the queue"      RequestQueueSize overload
+        </pre></div>
+      </div>
+    </section>
+
+    <!-- Patching & Upgrades -->
+    <section id="patching">
+      <h2>OS Patching &amp; Kafka Version Upgrades</h2>
+
+      <div class="concept-card">
+        <h3>Zero-Downtime OS Patching (Rolling Procedure)</h3>
+        <ol class="step-list">
+          <li>
+            <strong>Pre-patch health gate</strong>
+            <div class="diagram"><pre>
+# Must be ZERO before touching any broker:
+kafka-topics.sh --bootstrap-server :9092 \
+  --describe --under-replicated-partitions
+# If non-zero: DO NOT PROCEED. Fix URP first.
+
+# Check active controller:
+kafka-metadata-quorum.sh --bootstrap-server :9092 describe
+# or: check JMX ActiveControllerCount = 1
+            </pre></div>
+          </li>
+          <li>
+            <strong>Pick a non-controller broker first</strong>
+            <p>Patching the controller causes a controller election (brief ~1s in KRaft). Do controller last to minimize disruption.</p>
+          </li>
+          <li>
+            <strong>Perform controlled shutdown</strong>
+            <div class="diagram"><pre>
+# Kafka will move its leaders to other brokers before stopping
+# (requires controlled.shutdown.enable=true — default: true)
+systemctl stop kafka
+
+# Verify the broker is gone from cluster:
+kafka-broker-api-versions.sh --bootstrap-server :9092 2>&1 | \
+  grep -v "BROKER_ID_TO_PATCH"
+            </pre></div>
+          </li>
+          <li>
+            <strong>Apply OS patch / kernel update</strong>
+            <div class="diagram"><pre>
+# RHEL/CentOS:
+yum update -y --security && reboot
+
+# Ubuntu:
+apt-get upgrade -y && reboot
+            </pre></div>
+          </li>
+          <li>
+            <strong>Post-reboot: start Kafka, wait for ISR recovery</strong>
+            <div class="diagram"><pre>
+systemctl start kafka
+
+# Poll URP until 0 (max wait: 10 minutes):
+while true; do
+  URP=$(kafka-topics.sh --bootstrap-server :9092 \
+        --describe --under-replicated-partitions | wc -l)
+  echo "URP: $URP"
+  [ "$URP" -eq 0 ] && break
+  sleep 15
+done
+            </pre></div>
+          </li>
+          <li>
+            <strong>URP = 0 → proceed to next broker</strong>
+            <p>Only move to the next broker once the previous one has fully rejoined ISR. Never patch two brokers simultaneously.</p>
+          </li>
+          <li>
+            <strong>Controller broker last</strong>
+            <p>When patching the controller broker, KRaft elects a new controller in &lt;1s. ZK-based clusters: allow 10–30s for election. Validate <code>ActiveControllerCount=1</code> after restart.</p>
+          </li>
+        </ol>
+        <div class="callout tip">
+          <strong>Automation:</strong> Encode this as an Ansible playbook with <code>serial: 1</code>, pre/post URP check tasks, and <code>max_fail_percentage: 0</code>. See the IaC page for the full playbook. Never run ad-hoc patching — always use the playbook.
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Kafka Version Upgrade (Two-Phase Rolling Upgrade)</h3>
+        <div class="diagram">
+          <b>Why Two Phases?</b>
+          <pre>
+Phase 1: Upgrade binary (JAR files) — REVERSIBLE
+  All brokers run new binary but communicate using the OLD
+  inter.broker.protocol.version (IBP). Mixed-version cluster is safe.
+
+Phase 2: Bump IBP and log.message.format.version — IRREVERSIBLE
+  Once IBP is set to the new version on all brokers, you cannot
+  downgrade without wiping broker state. Do this only after Phase 1
+  has been stable in production for ≥ 48 hours.
+          </pre>
+          <b>Phase 1 — Binary upgrade (per broker, rolling)</b>
+          <pre>
+# In server.properties: KEEP OLD VALUES during phase 1:
+inter.broker.protocol.version=3.6   ← don't change yet
+log.message.format.version=3.6      ← don't change yet
+
+For each broker:
+  1. URP check (must be 0)
+  2. Stop Kafka: systemctl stop kafka
+  3. Swap JAR: update symlink to new kafka binary
+  4. Start Kafka: systemctl start kafka
+  5. Verify broker joins, URP returns to 0
+  6. Move to next broker
+
+After all brokers on new binary:
+  - Test for 48h, monitor metrics
+  - If rollback needed: repeat with old binary (just swap JAR)
+          </pre>
+          <b>Phase 2 — IBP bump (cluster-wide, IRREVERSIBLE)</b>
+          <pre>
+# Update ALL brokers' server.properties simultaneously
+# (via Ansible/Strimzi), then rolling restart:
+inter.broker.protocol.version=3.7   ← new version
+log.message.format.version=3.7      ← new version
+
+# Or use dynamic config for kafka cluster-level (Kafka 3.3+):
+kafka-configs.sh --bootstrap-server :9092 \
+  --entity-type brokers --entity-default --alter \
+  --add-config inter.broker.protocol.version=3.7
+
+⚠️  POINT OF NO RETURN: After all brokers use IBP=3.7,
+    downgrading requires wiping and restoring from replica.
+          </pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Version Selection -->
+    <section id="version">
+      <h2>Kafka Version Selection</h2>
+
+      <div class="concept-card">
+        <h3>Version Selection Criteria</h3>
+        <table class="kv-table">
+          <thead><tr><th>Criterion</th><th>Guidance</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Stability over features</td>
+              <td>Pick a version that has been released for ≥3 months and has at least 2 patch releases. Avoid .0 releases (3.7.0 → prefer 3.7.1+).</td>
+            </tr>
+            <tr>
+              <td>KRaft vs ZooKeeper</td>
+              <td>KRaft is GA from Kafka 3.3+. For new clusters (2024+): use KRaft. For existing ZK clusters: plan migration to KRaft before ZK support is removed (targeted ~Kafka 4.0).</td>
+            </tr>
+            <tr>
+              <td>Managed service alignment</td>
+              <td>If using MSK: check AWS supported versions. MSK often lags behind community by 1–2 minor versions. Confluent Cloud has its own versioning.</td>
+            </tr>
+            <tr>
+              <td>Key features by version</td>
+              <td>
+                <table class="kv-table" style="margin:0">
+                  <tr><td><b>3.3</b></td><td>KRaft GA</td></tr>
+                  <tr><td><b>3.4</b></td><td>ZK→KRaft migration tool GA</td></tr>
+                  <tr><td><b>3.6</b></td><td>Tiered Storage GA, KRaft controller failover improvements</td></tr>
+                  <tr><td><b>3.7</b></td><td>Improved client-side rack awareness, Share Groups preview</td></tr>
+                  <tr><td><b>3.8+</b></td><td>Share Groups (queue semantics), further KRaft improvements</td></tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td>Java compatibility</td>
+              <td>Kafka 3.3+ requires Java 11+. Kafka 3.5+ supports Java 21 (recommended for virtual threads). Use Java 21 with G1GC or ZGC for new deployments.</td>
+            </tr>
+            <tr>
+              <td>Client compatibility</td>
+              <td>Kafka protocol is backwards compatible: new brokers support old clients. But new client features (cooperative rebalance, EOS v2) require updated client JARs. Always upgrade brokers before clients.</td>
+            </tr>
+            <tr>
+              <td>Security patches</td>
+              <td>Subscribe to the Kafka security mailing list. CVEs in Kafka are rare but real. Apply patch releases promptly (e.g., 3.6.1 → 3.6.2 for a CVE is low risk and quick to apply).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <strong>Recommended version for new production clusters (2025):</strong> Kafka 3.7.x or 3.8.x with KRaft, Java 21, and Strimzi on Kubernetes or dedicated VMs with Ansible. ZooKeeper clusters should plan migration to KRaft before Kafka 4.0 removes ZK support.
+        </div>
+      </div>
+    </section>
+
+    <!-- Infrastructure Tooling -->
+    <section id="infra-tooling">
+      <h2>Infrastructure &amp; Platform Orchestration</h2>
+
+      <div class="concept-card">
+        <h3>Technology Decision Matrix</h3>
+        <table class="kv-table">
+          <thead><tr><th>Layer</th><th>Tool</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>Cloud infrastructure (VMs, VPCs, MSK)</td><td><strong>Terraform</strong></td><td>Declarative, state-tracked, provider ecosystem (AWS/GCP/Azure/Confluent). IaC review via PRs.</td></tr>
+            <tr><td>VM-based Kafka broker management</td><td><strong>Ansible</strong></td><td>Agentless, idempotent. Rolling restart playbook. Config templating (Jinja2). Vault integration.</td></tr>
+            <tr><td>Kubernetes-based Kafka</td><td><strong>Strimzi Operator</strong></td><td>CRD-native, handles TLS, rolling upgrades, user management, Connect orchestration. CNCF incubating.</td></tr>
+            <tr><td>Helm chart deployment</td><td><strong>Helm 3 + Helmfile</strong></td><td>Strimzi operator deployment, environment-specific values overlays, atomic upgrades with --atomic.</td></tr>
+            <tr><td>GitOps / continuous reconciliation</td><td><strong>ArgoCD</strong></td><td>Declarative sync from Git to K8s. selfHeal reverts drift. PR-based change management. RBAC for K8s resources.</td></tr>
+            <tr><td>Secrets management</td><td><strong>HashiCorp Vault + ESO</strong></td><td>Vault stores credentials/certs. External Secrets Operator (ESO) syncs to K8s Secrets. Vault manages rotation.</td></tr>
+            <tr><td>CI for connectors/topics</td><td><strong>GitHub Actions / GitLab CI</strong></td><td>Lint → staging deploy → integration test → approval → prod deploy. Connector config as code.</td></tr>
+            <tr><td>Certificate management (K8s)</td><td><strong>cert-manager</strong></td><td>Auto-issue/renew TLS certs from ACME/Vault PKI/internal CA. Strimzi integrates natively with cert-manager.</td></tr>
+            <tr><td>Policy enforcement</td><td><strong>OPA/Conftest or Kyverno</strong></td><td>Validate KafkaTopic CRs (RF≥3, min.ISR≥2, naming conventions) before merge. Prevent misconfig at PR time.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <h3>Reference Platform Stack (K8s deployment)</h3>
+        <div class="diagram">
+          <pre>
+Git Repository (kafka-platform-gitops)
+    │
+    │  PRs → OPA policy checks → peer review → merge
+    ▼
+ArgoCD
+    │  Sync to cluster
+    ├─▶ Strimzi Operator       (namespace: strimzi-system)
+    ├─▶ Kafka Cluster CR       (namespace: kafka-prod)
+    │     ├── 3 KRaft controllers (KafkaNodePool)
+    │     └── 6 Kafka brokers   (KafkaNodePool)
+    ├─▶ KafkaTopic CRs         (Topic Operator manages lifecycle)
+    ├─▶ KafkaUser CRs          (User Operator manages SCRAM/TLS)
+    ├─▶ KafkaConnect CR        (3 workers, Debezium + S3 Sink)
+    ├─▶ KafkaConnector CRs     (individual connector configs)
+    ├─▶ Schema Registry        (Confluent or Apicurio, 3 replicas)
+    ├─▶ ksqlDB                 (StatefulSet, 3 nodes, RocksDB PVCs)
+    └─▶ REST Proxy             (Deployment, 3 replicas, Nginx LB)
+
+External Secrets Operator
+    │ Syncs creds from Vault
+    └─▶ K8s Secrets (Kafka SCRAM passwords, SR creds, etc.)
+
+cert-manager
+    └─▶ Strimzi TLS certificates (auto-renewed, 90-day lifetime)
+
+Prometheus Operator
+    └─▶ ServiceMonitor → scrapes JMX Exporter from all pods
+          </pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Password & Certificate Rotation -->
+    <section id="secrets">
+      <h2>Password &amp; Certificate Rotation</h2>
+
+      <div class="concept-card">
+        <h3>SASL/SCRAM Password Rotation (Zero Downtime)</h3>
+        <div class="diagram">
+          <b>How SCRAM credential rotation works</b>
+          <pre>
+SCRAM credentials are stored in ZooKeeper (ZK mode) or
+the Kafka cluster itself (KRaft: __cluster_metadata).
+No broker restart is required to update SCRAM passwords.
+
+Step 1: Add NEW credential alongside existing one
+  kafka-configs.sh --bootstrap-server :9092 \
+    --entity-type users --entity-name payments-producer \
+    --alter \
+    --add-config 'SCRAM-SHA-512=[password=new-secret-password]'
+
+  ↑ This REPLACES the existing credential immediately.
+  ↑ Client using old password will FAIL after this step.
+
+  → Therefore: update clients BEFORE rotating the broker config.
+
+Correct zero-downtime sequence:
+  1. Generate new password → store in Vault
+  2. Deploy new client config (new password) to a SUBSET of pods
+     (canary: 1 of 10 pods gets new password)
+  3. Verify canary pods authenticate successfully
+  4. Run kafka-configs.sh to update broker with new password
+  5. Deploy new password to ALL remaining pods
+  6. Verify all clients connected
+  7. (Optional) Remove old password from Vault/secrets manager
+          </pre>
+          <b>Strimzi KafkaUser automation</b>
+          <pre>
+# Update KafkaUser CR with new password secret reference:
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: payments-producer
+spec:
+  authentication:
+    type: scram-sha-512
+    password:
+      valueFrom:
+        secretKeyRef:
+          name: payments-producer-secret  # K8s Secret
+          key: password
+
+# Strimzi User Operator watches this CR.
+# When the K8s Secret is rotated by ESO (from Vault),
+# Strimzi automatically updates the SCRAM credential on the broker.
+# Clients using the new password from the Secret can authenticate immediately.
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>TLS Certificate Rotation (Zero Downtime)</h3>
+        <div class="diagram">
+          <b>Problem: broker has a single keystore → swap causes downtime</b>
+          <pre>
+Solution — Double-cert trick (dual-cert keystores):
+  Phase 1: Add new cert to keystore ALONGSIDE old cert
+    keytool -importcert -alias new-cert -keystore kafka.keystore.jks
+    → Brokers now have both old and new cert
+    → Clients trust EITHER cert (truststore has both CA certs)
+
+  Phase 2: Rolling restart (one broker at a time)
+    → Each broker restarted presents new cert as primary
+    → Clients connected to other brokers still have valid connections
+
+  Phase 3: Remove old cert from keystores
+    keytool -delete -alias old-cert -keystore kafka.keystore.jks
+    → Clean up old cert after all brokers have rotated
+
+  Phase 4: Remove old CA from truststores (if CA changed)
+    → Only after all clients have updated to trust new CA
+          </pre>
+          <b>cert-manager + Strimzi automation</b>
+          <pre>
+# cert-manager issues certificates with 90-day lifetime.
+# Strimzi detects cert expiry 30 days in advance and performs
+# an automatic rolling restart with the double-cert trick.
+# Zero operator action required.
+
+# Monitor cert expiry:
+kubectl get certificates -n kafka-prod
+# READY=True, EXPIRY should be >30 days away
+
+# Force immediate rotation (for compromised cert):
+kubectl annotate certificate kafka-broker-cert \
+  cert-manager.io/issuer-kind=ClusterIssuer \
+  force-renew="$(date)" -n kafka-prod
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Vault-Based Secrets Lifecycle</h3>
+        <div class="diagram">
+          <pre>
+All Kafka credentials flow:
+  Vault PKI     → TLS certificates (auto-renewed via cert-manager)
+  Vault KV      → SCRAM passwords (rotated via ESO + KafkaUser CR)
+  Vault KV      → Schema Registry API keys
+  Vault KV      → Kafka Connect connector credentials (DB passwords, S3 keys)
+
+Rotation schedule:
+  TLS certs:            90-day lifetime, auto-rotated at day 60
+  SCRAM passwords:      Rotate every 90 days OR on personnel change
+  API keys (if used):   Rotate every 180 days
+  Service account keys: Rotate every 90 days
+
+Audit:
+  Vault audit log captures every secret access.
+  Feed to SIEM (Splunk/Elastic) to detect anomalous credential reads.
+  Alert on: secret read from unexpected IP, high-frequency reads,
+            reads outside business hours.
+          </pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- HA for Platform Components -->
+    <section id="ha-components">
+      <h2>HA for Platform Components</h2>
+
+      <div class="concept-card">
+        <h3>Schema Registry HA</h3>
+        <div class="diagram">
+          <pre>
+Architecture:
+  3 Schema Registry instances behind a Load Balancer (or K8s Service)
+  One instance is the LEADER (handles writes)
+  Others are FOLLOWERs (serve reads from their cache)
+
+Leader election:
+  Uses Kafka's own consumer group protocol on the _schemas topic.
+  If leader dies, a follower becomes leader in seconds.
+
+Configuration for multiple instances:
+  kafkastore.bootstrap.servers=kafka:9092
+  listeners=http://0.0.0.0:8081
+  host.name=sr-instance-1.internal  # unique per instance
+
+Client resilience:
+  url=http://sr-1:8081,http://sr-2:8081,http://sr-3:8081
+  ↑ Client caches schema locally — continues working even if ALL SR instances die,
+    as long as no new schemas are needed.
+
+Availability:
+  Load balancer health check: GET /subjects (200=healthy)
+  PDB: maxUnavailable=1 (Kubernetes)
+  Anti-affinity: spread across 3 AZs
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>Kafka Connect HA</h3>
+        <div class="diagram">
+          <pre>
+Distributed mode: 3+ worker nodes form a Connect cluster
+  - Connector/task assignments distributed across workers
+  - If a worker dies: tasks reassigned to surviving workers in &lt;60s
+  - Internal topics (connect-configs, connect-offsets, connect-status):
+      replication.factor=3, min.insync.replicas=2
+
+Worker configuration for HA:
+  group.id=hsbc-connect-cluster           # All workers share same group
+  offset.flush.interval.ms=10000          # 10s offset flush
+  config.storage.topic=connect-configs    # RF=3
+  offset.storage.topic=connect-offsets    # RF=3, 25 partitions
+  status.storage.topic=connect-status     # RF=3
+
+K8s: Run as Deployment (not StatefulSet — workers are stateless)
+  replicas: 3
+  PDB: maxUnavailable=1
+  Anti-affinity: spread across AZs
+
+DLQ for resilience:
+  errors.tolerance=all
+  errors.deadletterqueue.topic.name=my-connector.dlq
+  → Failed records go to DLQ; connector continues processing
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>ksqlDB HA</h3>
+        <div class="diagram">
+          <pre>
+Clustered ksqlDB (production):
+  3+ ksqlDB server nodes with shared Kafka bootstrap.servers
+
+State store HA:
+  num.standby.replicas=1 (or 2 for critical queries)
+  → Each partition's RocksDB state store has a warm standby
+    on another node. Failover is fast (&lt;10s).
+
+Internal topics:
+  _confluent-ksql-default__command_topic     RF=3  (query DDL log)
+  _confluent-ksql-*-ksql_processing_log      RF=3  (processing errors)
+
+Load balancer:
+  ksqlDB servers are stateful — use sticky sessions for pull queries.
+  Push queries (EMIT CHANGES) can go to any server.
+
+K8s: StatefulSet (for stable hostname + PVC per node)
+  replicas: 3
+  volumeClaimTemplates: RocksDB on fast SSD (8Gi+)
+  PDB: maxUnavailable=1
+  Anti-affinity: spread across AZs
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>REST Proxy HA</h3>
+        <div class="diagram">
+          <pre>
+Challenge: REST Proxy is stateful for consumer sessions.
+  Consumer instance is created on a specific proxy server.
+  Subsequent poll/commit/delete MUST go to the same server.
+
+Solutions:
+  Option A: Sticky sessions at load balancer (simplest)
+    nginx: ip_hash or cookie-based sticky
+    AWS ALB: sticky sessions (duration-based cookie)
+    → If the proxy instance dies, consumer session is lost.
+      Client must re-create consumer instance. Acceptable for most use cases.
+
+  Option B: Only use REST Proxy for producing (stateless path)
+    POST /topics/{topic} is fully stateless — any server handles it.
+    Use native Kafka clients for consuming (avoids sticky routing problem entirely).
+
+  Option C: Client-side session affinity
+    REST Proxy returns X-Instance-ID header after consumer create.
+    Client tracks which proxy URL hosts its consumer instance.
+    If that proxy is down: catch 404, re-create consumer, seek to last committed offset.
+
+K8s: Deployment (stateless for produce path)
+  replicas: 3
+  PDB: maxUnavailable=1
+  Anti-affinity: spread across AZs
+  consumer.instance.timeout.ms: 300000 (5 min leak prevention)
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>KRaft Controller HA</h3>
+        <div class="diagram">
+          <pre>
+KRaft quorum: 3 or 5 dedicated controller nodes
+
+Quorum fault tolerance:
+  3 controllers → tolerate 1 failure (need 2/3 for quorum)
+  5 controllers → tolerate 2 failures (need 3/5 for quorum)
+
+Controller failover:
+  Active controller fails → follower with most up-to-date log becomes leader
+  Failover time: typically &lt;500ms (Raft is fast)
+  During failover: no new metadata operations, but existing produce/consume continues
+
+Controller nodes (KRaft-only clusters):
+  process.roles=controller          ← dedicated controllers
+  node.id=1 (2, 3)
+  controller.quorum.voters=1@ctrl-1:9093,2@ctrl-2:9093,3@ctrl-3:9093
+
+  K8s: StatefulSet, 3 replicas, 1 per AZ
+  No Kafka data stored on controllers (they only store metadata)
+  Modest hardware: 4 vCPU, 16 GB RAM, 100 GB SSD is sufficient
+
+Monitoring:
+  kafka.controller:type=KafkaController,name=ActiveControllerCount
+  kafka-metadata-quorum.sh --describe → shows leader, lag, offset
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>ZooKeeper HA (legacy clusters)</h3>
+        <div class="diagram">
+          <pre>
+ZK ensemble sizing:
+  3 nodes → tolerate 1 failure
+  5 nodes → tolerate 2 failures (recommended for critical production)
+
+ZK requires majority for writes:
+  3-node with 1 down → still writable (2/3 = majority)
+  3-node with 2 down → read-only at best, usually unavailable
+
+ZK node hardware: modest — 4 vCPU, 8 GB RAM, fast SSD for txn log
+ZK txn log: dedicated disk, separate from snapshot disk
+  dataLogDir=/data/zk/txlog     ← fast dedicated SSD
+  dataDir=/data/zk/data         ← can share with OS disk
+
+ZK config (zoo.cfg):
+  tickTime=2000
+  initLimit=10
+  syncLimit=5
+  server.1=zk-1:2888:3888
+  server.2=zk-2:2888:3888
+  server.3=zk-3:2888:3888
+
+Monitoring:
+  ZK 4-letter commands: echo ruok | nc zk-1 2181
+  Prometheus zkmetrics via zookeeper_exporter
+  Alert on: OutstandingRequests &gt; 10, AvgLatency &gt; 10ms
+
+⚠️  Plan ZK → KRaft migration. ZK support removed in Kafka 4.0.
+          </pre>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <h3>HA Summary Table</h3>
+        <table class="kv-table">
+          <thead><tr><th>Component</th><th>Min Instances</th><th>Failover Time</th><th>State Concern</th><th>K8s Type</th></tr></thead>
+          <tbody>
+            <tr><td>Kafka Broker</td><td>3 (1 per AZ)</td><td>&lt;1s (KRaft leader election)</td><td>Disk (JBOD, PVC). <code>deleteClaim: false</code> critical.</td><td>StatefulSet</td></tr>
+            <tr><td>KRaft Controller</td><td>3 (1 per AZ)</td><td>&lt;500ms</td><td>Metadata log only. Small PVC.</td><td>StatefulSet</td></tr>
+            <tr><td>ZooKeeper (legacy)</td><td>3 or 5</td><td>6–30s (session timeout)</td><td>Txn log + snapshots. Dedicated disk.</td><td>StatefulSet</td></tr>
+            <tr><td>Schema Registry</td><td>3</td><td>&lt;10s (leader re-election)</td><td>Stateless (state in _schemas topic). Clients cache schemas locally.</td><td>Deployment</td></tr>
+            <tr><td>Kafka Connect</td><td>3</td><td>&lt;60s (task reassignment)</td><td>Stateless workers. Offsets in connect-offsets topic.</td><td>Deployment</td></tr>
+            <tr><td>ksqlDB</td><td>3</td><td>&lt;10s (standby promotion)</td><td>RocksDB state stores. Replicated via changelog topics.</td><td>StatefulSet</td></tr>
+            <tr><td>REST Proxy</td><td>3</td><td>Session-level (new session needed)</td><td>Consumer sessions sticky per proxy. Produce path stateless.</td><td>Deployment</td></tr>
+            <tr><td>MirrorMaker 2</td><td>3 Connect workers</td><td>&lt;60s (same as Connect)</td><td>Offsets in mm2-offsets topic on source cluster.</td><td>Deployment</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div>
+</body>
+</html>

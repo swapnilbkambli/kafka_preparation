@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZooKeeper to KRaft Migration — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🗳️ ZooKeeper → KRaft Migration</h1>
+  <div class="header-right"><span class="pill pill-blue">Concepts</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#why">Why Migrate</a>
+  <a href="#kraft-arch">KRaft Architecture</a>
+  <a href="#zk-arch">ZooKeeper Architecture</a>
+  <a href="#comparison">ZK vs KRaft Comparison</a>
+  <a href="#migration">Migration Steps</a>
+  <a href="#pre-checks">Pre-Migration Checks</a>
+  <a href="#rollback">Rollback Plan</a>
+  <a href="#gotchas">Gotchas &amp; Pitfalls</a>
+  <a href="#qa">Concepts &amp; Scenario Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Why Migrate -->
+<div class="section" id="why">
+  <div class="section-header"><span class="section-icon">🚀</span><span class="section-title">Why Migrate from ZooKeeper to KRaft</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Operational Simplicity</h4>
+      <p>ZK mode requires running two separate systems (ZooKeeper ensemble + Kafka cluster), each with its own monitoring, upgrades, security, and failure modes. KRaft eliminates ZooKeeper entirely — one system to operate.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Scalability</h4>
+      <p>ZooKeeper is a bottleneck for metadata operations. Practical limit: ~200,000 partitions per cluster. KRaft stores metadata in a Kafka log — scales to millions of partitions. Critical for large-scale deployments.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Faster Controller Failover</h4>
+      <p>ZK controller failover: new controller reads all metadata from ZK (~seconds to minutes for large clusters). KRaft: metadata already replicated to controller quorum — failover in milliseconds.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Deprecation Timeline</h4>
+      <p>ZooKeeper support removed in Kafka 4.0 (released 2025). Any cluster still on ZK mode must migrate to upgrade past Kafka 3.x. This is not optional long-term.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Security Simplification</h4>
+      <p>ZK mode requires securing both ZooKeeper (SASL, mTLS) and Kafka independently. KRaft has one unified security model. Fewer auth configurations, fewer attack surfaces.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Startup Time</h4>
+      <p>ZK-mode brokers read all partition metadata from ZK on startup — slow for large clusters. KRaft brokers fetch metadata from the quorum log — much faster startup and recovery.</p>
+    </div>
+  </div>
+</div>
+
+<!-- KRaft Architecture -->
+<div class="section" id="kraft-arch">
+  <div class="section-header"><span class="section-icon">🏛️</span><span class="section-title">KRaft Architecture</span></div>
+
+  <div class="diagram">  KRAFT CLUSTER ARCHITECTURE:
+  ─────────────────────────────────────────────────────────────────
+
+  Option A: Dedicated Controller Nodes (recommended for production)
+  ┌─────────────────────────────┐  ┌─────────────────────────┐
+  │    Controller Quorum        │  │    Broker Nodes          │
+  │  ┌───────┐ ┌───────┐ ┌───┐ │  │  ┌──────┐ ┌──────┐     │
+  │  │ Ctrl1 │ │ Ctrl2 │ │C3 │ │  │  │ Brk1 │ │ Brk2 │ ... │
+  │  │(lead) │ │(follw)│ │(f)│ │  │  └──────┘ └──────┘     │
+  │  └───────┘ └───────┘ └───┘ │  └─────────────────────────┘
+  │  Raft consensus on          │        │ fetch metadata
+  │  __cluster_metadata topic   │◄───────┘ (MetadataFetch)
+  └─────────────────────────────┘
+
+  Option B: Combined Mode (brokers also act as controllers)
+  ┌──────────────────────────────────────────────────────────┐
+  │  Node-1          Node-2          Node-3                   │
+  │  [broker+ctrl]   [broker+ctrl]   [broker+ctrl]            │
+  │  role=controller,broker (in server.properties)            │
+  └──────────────────────────────────────────────────────────┘
+  Simpler for small clusters; dedicated preferred for large.
+
+  RAFT CONSENSUS OVERVIEW:
+  - Active Controller = Raft leader (elected by quorum)
+  - All metadata changes: Ctrl1 appends to __cluster_metadata log
+  - Other controllers and brokers fetch from leader
+  - Quorum write: majority of controllers must ack before commit
+  - Leader election: Raft election when leader fails
+  - No ZooKeeper session concept — pure TCP heartbeats
+
+  __cluster_metadata TOPIC:
+  - Single partition, replicated to all controller nodes
+  - Stores: broker registrations, topic/partition state,
+            leader epochs, ISR changes, ACLs, quotas, configs
+  - Brokers cache latest snapshot + tail of the log locally</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Active Controller (Raft Leader)</h4>
+      <p>The single writer for cluster metadata. Processes admin requests (create topic, elect leader, etc.) and appends records to the <code>__cluster_metadata</code> log. Elected by Raft — majority quorum vote.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Controller Quorum</h4>
+      <p>Typically 3 or 5 controllers. Quorum of <code>(N/2)+1</code> must be available for writes. 3 controllers: tolerates 1 failure. 5 controllers: tolerates 2 failures. Controllers vote for leader via Raft protocol.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Metadata Log</h4>
+      <p><code>__cluster_metadata</code> is an internal Kafka topic. Brokers subscribe to it — they maintain a local snapshot + recent log entries to serve metadata requests without hitting the active controller.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Broker Registration</h4>
+      <p>In KRaft, brokers register with the active controller via <code>BrokerRegistration</code> RPC (not ZK ephemeral nodes). Controller tracks live brokers. If a broker doesn't heartbeat, controller fences it.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ZK Architecture -->
+<div class="section" id="zk-arch">
+  <div class="section-header"><span class="section-icon">🌳</span><span class="section-title">ZooKeeper Architecture (Legacy)</span></div>
+
+  <div class="diagram">  ZOOKEEPER MODE ARCHITECTURE:
+  ─────────────────────────────────────────────────────────────────
+
+  ZooKeeper Ensemble (3 or 5 nodes):
+  ┌──────┐  ┌──────┐  ┌──────┐
+  │ ZK1  │  │ ZK2  │  │ ZK3  │   ZAB protocol (similar to Raft)
+  │(lead)│  │(flw) │  │(flw) │   Stores: /brokers/ids, /topics,
+  └───┬──┘  └──────┘  └──────┘   /controller, /config, /ISR...
+      │
+      │ Kafka brokers connect to ZK
+      ▼
+  Kafka Broker Cluster:
+  ┌──────┐  ┌──────┐  ┌──────┐
+  │ Brk1 │  │ Brk2 │  │ Brk3 │
+  │(ctrl)│  │      │  │      │   One broker is "Controller"
+  └──────┘  └──────┘  └──────┘   elected via ZK ephemeral node
+
+  ZK PATHS (metadata storage):
+  /brokers/ids/{broker_id}          ← live brokers (ephemeral)
+  /brokers/topics/{topic}/partitions/{p}/state  ← ISR, leader
+  /controller                        ← current controller broker
+  /config/topics/{topic}            ← topic overrides
+  /admin/reassign_partitions        ← in-progress reassignments
+  /zookeeper/quota/...              ← quotas</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>ZK failure modes to know:</strong> ZK session expiry causes the controller to lose its /controller znode → triggers controller re-election on another broker → during this window (~6s), no metadata changes can be made. GC pause on the controller broker > ZK session timeout causes spurious leader re-election even though the broker is healthy — a classic cause of instability.</div>
+  </div>
+</div>
+
+<!-- Comparison -->
+<div class="section" id="comparison">
+  <div class="section-header"><span class="section-icon">⚖️</span><span class="section-title">ZK vs KRaft Detailed Comparison</span></div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>ZooKeeper Mode</th><th>KRaft Mode</th></tr>
+    <tr><td>Metadata store</td><td>External ZK ensemble</td><td>Internal <code>__cluster_metadata</code> Kafka log</td></tr>
+    <tr><td>Consensus protocol</td><td>ZAB (ZooKeeper Atomic Broadcast)</td><td>Raft (in the controller quorum)</td></tr>
+    <tr><td>Controller election</td><td>First to write ZK /controller znode</td><td>Raft leader election by quorum vote</td></tr>
+    <tr><td>Controller failover time</td><td>6–30 seconds (ZK session timeout + metadata read)</td><td>Milliseconds (metadata already replicated)</td></tr>
+    <tr><td>Max partitions</td><td>~200K (ZK write bottleneck)</td><td>Millions (Kafka log scales horizontally)</td></tr>
+    <tr><td>Systems to operate</td><td>2 (ZK ensemble + Kafka)</td><td>1 (Kafka only)</td></tr>
+    <tr><td>Security surface</td><td>ZK SASL/TLS + Kafka auth (separate)</td><td>Unified Kafka auth only</td></tr>
+    <tr><td>Broker startup speed</td><td>Slow (read all ZK nodes on start)</td><td>Fast (fetch from controller log)</td></tr>
+    <tr><td>Available since</td><td>Kafka 0.x</td><td>Production-ready: Kafka 3.3</td></tr>
+    <tr><td>Removed in</td><td>Kafka 4.0 (ZK support gone)</td><td>N/A (only mode from Kafka 4.0)</td></tr>
+    <tr><td>Migration tool</td><td>N/A</td><td><code>kafka-storage.sh</code> + migration mode</td></tr>
+  </table>
+</div>
+
+<!-- Migration Steps -->
+<div class="section" id="migration">
+  <div class="section-header"><span class="section-icon">🔀</span><span class="section-title">ZK → KRaft Migration Steps (Kafka 3.4+)</span></div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Migration mode:</strong> Kafka 3.4+ supports <strong>dual-write migration</strong> — a cluster can run in a hybrid mode where the ZK controller and a KRaft controller quorum coexist temporarily. This allows zero-downtime migration. Kafka 4.0 requires KRaft — you must complete migration before upgrading to 4.0.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Upgrade Kafka to 3.4+ (while still on ZK)</strong><br>All brokers must be on Kafka 3.4+ before starting KRaft migration. Perform rolling upgrade of the ZK-mode cluster first. Verify cluster health post-upgrade: zero URP, all brokers online.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Enable migration on brokers</strong><br>Set <code>zookeeper.metadata.migration.enable=true</code> in broker configs. Do NOT restart yet — just prepare the config.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Provision KRaft controller nodes</strong><br>Set up 3 (or 5) dedicated KRaft controller nodes with:<br><code>process.roles=controller</code><br><code>controller.quorum.voters=1@ctrl1:9093,2@ctrl2:9093,3@ctrl3:9093</code><br><code>node.id=1</code> (unique per controller)<br>Generate cluster ID from existing ZK cluster: <code>kafka-storage.sh format --cluster-id $(kafka-storage.sh random-uuid) --config server.properties</code><br><strong>Important:</strong> Use the SAME cluster ID as the existing ZK cluster. Get it from ZK: <code>zookeeper-shell.sh localhost:2181 get /cluster/id</code></div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Start KRaft controllers in migration mode</strong><br>Start the KRaft controller nodes. They connect to ZooKeeper and read existing metadata. The active KRaft controller becomes the <strong>migration leader</strong> — it reads all ZK metadata and writes it to the <code>__cluster_metadata</code> log. ZK controller demotes itself; KRaft controller takes over metadata management. Brokers still connected to ZK for now.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Rolling restart of brokers to KRaft mode</strong><br>Update each broker's config to add KRaft controller quorum details. Remove ZK configs from broker properties. Restart brokers one by one (rolling restart protocol). Each restarted broker registers with KRaft controller instead of ZK. After all brokers migrated, cluster runs KRaft but ZK is still connected (hybrid mode).</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Finalize migration (disconnect ZK)</strong><br>Run: <code>kafka-features.sh --bootstrap-server broker:9092 upgrade --feature metadata.version=N</code><br>This atomically completes migration — ZK is no longer used. After this step, rollback is impossible without a full restore. Monitor cluster health carefully.</div></div>
+    <div class="step"><div class="step-num">7</div><div class="step-body"><strong>Decommission ZooKeeper</strong><br>Verify cluster runs cleanly in KRaft-only mode for several days. Monitor: controller failover, topic creation, partition reassignment. When confident: shut down ZK ensemble. Decommission ZK VMs/containers.</div></div>
+  </div>
+
+  <div class="diagram">  KEY CONFIGS FOR KRAFT CONTROLLERS:
+  ─────────────────────────────────────────────────────
+  # controller server.properties
+  process.roles=controller                        # or "broker,controller" for combined
+  node.id=1                                       # unique integer, different from broker IDs
+  controller.quorum.voters=1@ctrl1:9093,2@ctrl2:9093,3@ctrl3:9093
+  listeners=CONTROLLER://:9093
+  controller.listener.names=CONTROLLER
+  log.dirs=/var/kafka/metadata                   # where metadata log is stored
+
+  # For migration (controller nodes also connect to ZK temporarily)
+  zookeeper.connect=zk1:2181,zk2:2181,zk3:2181/kafka
+  zookeeper.metadata.migration.enable=true
+
+  # KRAFT BROKER CONFIGS (post-migration):
+  process.roles=broker
+  node.id=10                                     # broker IDs should not overlap controller IDs
+  controller.quorum.voters=1@ctrl1:9093,2@ctrl2:9093,3@ctrl3:9093
+  # Remove all zookeeper.* settings</div>
+</div>
+
+<!-- Pre-Checks -->
+<div class="section" id="pre-checks">
+  <div class="section-header"><span class="section-icon">✅</span><span class="section-title">Pre-Migration &amp; Post-Migration Checks</span></div>
+
+  <table class="kv-table">
+    <tr><th>Phase</th><th>Check</th><th>Command / Verification</th></tr>
+    <tr><td><strong>Pre</strong></td><td>Zero under-replicated partitions</td><td><code>kafka-topics.sh --describe --under-replicated-partitions</code></td></tr>
+    <tr><td><strong>Pre</strong></td><td>All brokers on same Kafka version (3.4+)</td><td><code>kafka-broker-api-versions.sh</code> — verify API versions match</td></tr>
+    <tr><td><strong>Pre</strong></td><td>No in-progress partition reassignments</td><td><code>kafka-reassign-partitions.sh --verify</code></td></tr>
+    <tr><td><strong>Pre</strong></td><td>ZooKeeper health</td><td><code>echo ruok | nc zk1 2181</code> → should return "imok"</td></tr>
+    <tr><td><strong>Pre</strong></td><td>Cluster ID captured from ZK</td><td><code>zookeeper-shell.sh localhost:2181 get /cluster/id</code></td></tr>
+    <tr><td><strong>Pre</strong></td><td>Backup ZK data</td><td>Snapshot ZK data directory. Keep for rollback.</td></tr>
+    <tr><td><strong>Pre</strong></td><td>Test migration in staging</td><td>Full migration dry-run on non-production cluster first</td></tr>
+    <tr><td><strong>Post</strong></td><td>All brokers registered with KRaft controller</td><td><code>kafka-metadata-quorum.sh --bootstrap-server broker:9092 describe --status</code></td></tr>
+    <tr><td><strong>Post</strong></td><td>Metadata quorum is stable</td><td><code>kafka-metadata-quorum.sh describe --replication</code> — all voters caught up</td></tr>
+    <tr><td><strong>Post</strong></td><td>Topic create/delete works</td><td>Create and delete a test topic via kafka-topics.sh</td></tr>
+    <tr><td><strong>Post</strong></td><td>Consumer groups operational</td><td>Verify existing consumer groups still commit offsets</td></tr>
+    <tr><td><strong>Post</strong></td><td>ACLs intact</td><td>Check ACLs: <code>kafka-acls.sh --list</code></td></tr>
+    <tr><td><strong>Post</strong></td><td>Controller failover test</td><td>Kill active controller → verify new controller elected in &lt;1s</td></tr>
+  </table>
+</div>
+
+<!-- Rollback -->
+<div class="section" id="rollback">
+  <div class="section-header"><span class="section-icon">↩️</span><span class="section-title">Rollback Plan</span></div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Rollback is only possible before Step 6 (finalize migration).</strong> Once you run the feature upgrade command, ZK is permanently disconnected from the cluster state. After that point, the only rollback is restoring from a ZK snapshot (which means replaying all topic/consumer changes since the snapshot — significant data risk in production). Plan your migration during low-traffic windows with a clear rollback decision point.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Stop all KRaft controller nodes</strong><br>Shutdown the new KRaft controllers before they write any non-revertible metadata.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Rolling restart brokers back to ZK mode</strong><br>Revert broker configs: remove KRaft controller settings, restore ZK settings. Restart brokers one at a time.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Verify ZK connectivity and controller election</strong><br>Check that a broker has been elected controller via ZK. Verify all partitions have leaders.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Decommission KRaft controller nodes</strong><br>Wipe metadata logs from controller nodes to prevent stale state if re-attempted later.</div></div>
+  </div>
+</div>
+
+<!-- Gotchas -->
+<div class="section" id="gotchas">
+  <div class="section-header"><span class="section-icon">⚠️</span><span class="section-title">Gotchas &amp; Common Pitfalls</span></div>
+
+  <ul class="checklist">
+    <li><span class="ci">🚨</span><div><strong>Node ID overlap:</strong> Controller node IDs must not overlap with broker node IDs. Reserve a range: brokers 1–100, controllers 101–103.</div></li>
+    <li><span class="ci">🚨</span><div><strong>Wrong cluster ID:</strong> KRaft controllers must be formatted with the exact same cluster ID as the existing ZK cluster. Mismatch = cluster refuses to join.</div></li>
+    <li><span class="ci">⚠️</span><div><strong>ZK not decommissioned too early:</strong> Keep ZK running through the full migration and for several days after. Don't rush decommissioning before confirming cluster stability.</div></li>
+    <li><span class="ci">⚠️</span><div><strong>ACL migration:</strong> ZK-mode ACLs stored in ZK paths. KRaft stores them in the metadata log. They ARE migrated automatically, but verify all ACLs post-migration before decommissioning ZK.</div></li>
+    <li><span class="ci">⚠️</span><div><strong>Old Kafka clients:</strong> Very old clients (pre-0.10) used ZK directly. Post-migration, those clients break. Modern clients (0.10+) use broker bootstrap servers only — unaffected.</div></li>
+    <li><span class="ci">⚠️</span><div><strong>Monitoring tools:</strong> Tools that read ZK directly (e.g., Kafka Manager/CMAK, Kafdrop older versions) will stop working after ZK decommission. Migrate to tools with native KRaft support (Redpanda Console, AKHQ, Confluent Control Center 7.4+).</div></li>
+    <li><span class="ci">💡</span><div><strong>Combined mode in small clusters:</strong> For clusters with ≤5 brokers, combined mode (brokers acting as controllers) is fine. For large clusters, dedicated controller nodes prevent controller GC pauses from affecting data path.</div></li>
+    <li><span class="ci">💡</span><div><strong>Metadata snapshot size:</strong> After migration, <code>__cluster_metadata</code> may be large initially. KRaft periodically takes snapshots and truncates old log entries. Monitor disk usage on controller nodes.</div></li>
+  </ul>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Concepts &amp; Scenario Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        What is the Raft protocol and how does KRaft use it for metadata management?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Raft is a distributed consensus protocol designed to be understandable (vs Paxos). It guarantees that a cluster of N nodes can make consistent decisions as long as a majority (N/2+1) are available.
+        <br><br>
+        <strong>Key Raft concepts:</strong>
+        <ul>
+          <li><strong>Leader:</strong> One node receives all writes. Appends to log. Sends AppendEntries RPCs to followers.</li>
+          <li><strong>Followers:</strong> Replicate the leader's log. Vote in elections.</li>
+          <li><strong>Term:</strong> A monotonically increasing number. Each election starts a new term. Prevents stale leaders from confusing the cluster.</li>
+          <li><strong>Log commitment:</strong> An entry is committed once a majority acknowledges it. Committed entries survive leader failures.</li>
+          <li><strong>Leader election:</strong> When the leader fails, followers timeout and start an election. Candidate requests votes — wins if majority vote for it in the same term.</li>
+        </ul>
+        <strong>In KRaft:</strong> The <code>__cluster_metadata</code> log IS the Raft log. The active controller IS the Raft leader. All metadata changes (create topic, elect partition leader) are Raft log entries. Brokers subscribe to this log — they're Raft observers, not voters.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Your team runs Kafka 2.8. Leadership says you must be on Kafka 4.0 in 6 months. What's your migration plan?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Kafka 4.0 requires KRaft — you cannot skip to 4.0 from 2.8 directly. The migration path is:
+        <ol>
+          <li><strong>Month 1–2: Upgrade to Kafka 3.4+ (still ZK mode)</strong> — Kafka supports rolling upgrades one major version at a time. Go 2.8 → 3.0 → 3.4 in rolling upgrades. Each hop: upgrade one broker at a time, verify health, proceed.</li>
+          <li><strong>Month 2–3: Set up staging KRaft cluster</strong> — Build KRaft cluster in non-prod. Validate all connectors, tools, monitoring work with KRaft. Fix tooling issues (CMAK → AKHQ, etc.).</li>
+          <li><strong>Month 3–4: ZK → KRaft migration in staging</strong> — Perform full migration procedure on staging. Validate rollback procedure. Document lessons learned.</li>
+          <li><strong>Month 4–5: Production ZK → KRaft migration</strong> — During low-traffic window. Have ZK snapshot backup ready. Clear rollback decision gate before Step 6.</li>
+          <li><strong>Month 5–6: Kafka 4.0 upgrade</strong> — Once fully on KRaft, upgrade brokers to 4.0 via rolling restart. This is now a standard upgrade — no migration complexity.</li>
+        </ol>
+        <strong>Risk mitigation:</strong> Never upgrade Kafka version and migrate to KRaft in the same step. Separate concerns — fix upgrade issues first, then migrate. Build confidence at each stage.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        After completing ZK→KRaft migration, you notice that some consumer groups are missing their offsets. What happened?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Consumer group offsets are stored in the Kafka topic <code>__consumer_offsets</code> — NOT in ZooKeeper (since Kafka 0.10). Therefore, the KRaft migration does NOT affect consumer group offsets. They remain in <code>__consumer_offsets</code> on the brokers.
+        <br><br>
+        If offsets are missing after migration, the cause is likely unrelated to KRaft:
+        <ul>
+          <li><strong>Offset retention:</strong> <code>__consumer_offsets</code> has its own retention period (<code>offsets.retention.minutes</code>, default 7 days). Consumer groups that were inactive during migration may have had their offsets expire.</li>
+          <li><strong>Group ID mismatch:</strong> New consumer instances started with different group IDs.</li>
+          <li><strong>Partition reassignment during migration:</strong> If <code>__consumer_offsets</code> had URP or was reassigned, some offsets could be affected.</li>
+        </ul>
+        <strong>Fix:</strong> If offsets are genuinely gone (expired), reset consumers to the appropriate position: <code>--to-datetime</code> or <code>--to-earliest</code> depending on data availability and business requirements.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How does KRaft handle the case where the active controller fails mid-write?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        This is the core guarantee of Raft — it handles this safely:
+        <ul>
+          <li>If the controller fails <strong>before</strong> the write was committed (majority didn't ack) → the entry is NOT committed. After election, the new leader may or may not have this entry. If it does, it's truncated as it was uncommitted. Clients retry their request to the new controller.</li>
+          <li>If the controller fails <strong>after</strong> the write was committed (majority acked) → the entry IS durable. The new leader will have this entry in its log (since majority have it). It will be present in the new leader's log by definition of Raft commitment. The client may see a timeout if it didn't receive the response, but the write is safe — idempotent retries are safe.</li>
+        </ul>
+        <strong>Key property:</strong> A Raft leader can only be elected if it has the most up-to-date log (highest term + longest log). So the new leader always has all committed entries from the previous leader. No committed metadata is ever lost.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

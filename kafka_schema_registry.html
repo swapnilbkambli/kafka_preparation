@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Schema Registry — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>📋 Schema Registry</h1>
+  <div class="header-right"><span class="pill pill-purple">Ecosystem</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#what-is">What &amp; Why</a>
+  <a href="#formats">Schema Formats</a>
+  <a href="#wire-format">Wire Format</a>
+  <a href="#compatibility">Compatibility Modes</a>
+  <a href="#evolution">Schema Evolution</a>
+  <a href="#subjects">Subject Strategies</a>
+  <a href="#api">REST API</a>
+  <a href="#ha">High Availability</a>
+  <a href="#qa">Concepts &amp; Scenarios Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- What & Why -->
+<div class="section" id="what-is">
+  <div class="section-header"><span class="section-icon">📋</span><span class="section-title">What is Schema Registry and Why Use It?</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Kafka messages are opaque bytes — the broker doesn't know or care about their structure. Without Schema Registry, producers and consumers need out-of-band schema agreements. Any mismatch causes silent data corruption or deserialization failures in production.</p>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Schema Registry</h4>
+      <p>A standalone service (Confluent open source) that stores and manages schemas. Producers register schemas, get a schema ID, and embed the ID in each message. Consumers look up the schema by ID to deserialize.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Why It Matters</h4>
+      <p>Enforces schema compatibility at produce time (before bad data hits Kafka). Enables schema evolution without coordinated deployments. Provides a central schema catalog for data governance — critical in regulated industries like banking.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Schema Storage</h4>
+      <p>Schemas are stored in a Kafka topic: <code>_schemas</code> (compacted, single partition by default). Schema Registry reads this topic on startup. The Kafka cluster IS the schema database — no separate DB needed.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Schema Caching</h4>
+      <p>Both producers and consumers cache schemas locally. Producers cache: schema → schema ID. Consumers cache: schema ID → schema. Avoids hitting Schema Registry per message. Cache miss only on first use or schema expiry.</p>
+    </div>
+  </div>
+
+  <div class="diagram">  PRODUCE FLOW WITH SCHEMA REGISTRY:
+  ─────────────────────────────────────────────────────
+  1. Producer serializes record using Avro/Protobuf/JSON schema
+  2. Producer client calls SR: POST /subjects/payments-value/versions
+       → SR checks compatibility → returns schema_id = 42
+       (subsequent records: same schema → cached, no SR call)
+  3. Producer writes wire format to Kafka:
+       [0x00] [schema_id: 4 bytes] [serialized payload]
+  4. Consumer fetches bytes from Kafka
+  5. Consumer reads magic byte (0x00) + schema_id = 42
+  6. Consumer calls SR: GET /schemas/ids/42
+       → SR returns schema (cached after first call)
+  7. Consumer deserializes payload using schema 42</div>
+</div>
+
+<!-- Formats -->
+<div class="section" id="formats">
+  <div class="section-header"><span class="section-icon">📄</span><span class="section-title">Schema Formats: Avro vs Protobuf vs JSON Schema</span></div>
+
+  <table class="kv-table">
+    <tr><th>Aspect</th><th>Apache Avro</th><th>Protocol Buffers</th><th>JSON Schema</th></tr>
+    <tr><td>Encoding</td><td>Binary (compact)</td><td>Binary (compact, very efficient)</td><td>JSON (human-readable, verbose)</td></tr>
+    <tr><td>Schema in message</td><td>No (only schema ID). Needs SR.</td><td>No (only schema ID). Needs SR.</td><td>No (only schema ID). Needs SR.</td></tr>
+    <tr><td>Schema evolution</td><td>Excellent (field defaults)</td><td>Excellent (field numbers)</td><td>Good (optional fields)</td></tr>
+    <tr><td>Null handling</td><td>Explicit union type: <code>["null","string"]</code></td><td>Optional fields (proto3)</td><td>Nullable types</td></tr>
+    <tr><td>Language support</td><td>Most languages</td><td>Most languages, Google-maintained</td><td>Universal (any JSON parser)</td></tr>
+    <tr><td>Typical use</td><td>Most common in Kafka ecosystem</td><td>Google, gRPC-heavy shops</td><td>REST APIs, dev friendliness</td></tr>
+    <tr><td>Message size</td><td>Small</td><td>Smallest</td><td>Large</td></tr>
+  </table>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Interview tip:</strong> Avro is by far the most common in the Kafka ecosystem. Know it deeply. The key Avro feature is that reader and writer schemas can differ — the Avro library resolves field mappings between the two, enabling independent producer/consumer evolution.</div>
+  </div>
+</div>
+
+<!-- Wire Format -->
+<div class="section" id="wire-format">
+  <div class="section-header"><span class="section-icon">🔌</span><span class="section-title">Confluent Wire Format</span></div>
+
+  <div class="diagram">  Byte layout of a Kafka message value (Confluent wire format):
+  ┌──────────┬────────────────────┬─────────────────────────────────┐
+  │ Magic    │   Schema ID        │   Serialized Payload            │
+  │ 0x00     │   4 bytes (int32)  │   N bytes (Avro/Proto/JSON)     │
+  │ (1 byte) │   e.g. 0x0000002A │   binary encoded record         │
+  └──────────┴────────────────────┴─────────────────────────────────┘
+
+  Magic byte 0x00 = Confluent wire format marker
+  Schema ID = integer key into Schema Registry /schemas/ids/{id} endpoint
+
+  For Protobuf: additionally includes message index array after schema ID
+  (identifies which message type within the .proto file)</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Common issue:</strong> If a consumer tries to deserialize a message that wasn't produced with the Confluent wire format (e.g., plain JSON or string), it gets a <code>SerializationException: Unknown magic byte!</code>. This usually means a producer bypassed Schema Registry. Fix: enforce Schema Registry use via ACLs or API gateway policies.</div>
+  </div>
+</div>
+
+<!-- Compatibility Modes -->
+<div class="section" id="compatibility">
+  <div class="section-header"><span class="section-icon">🔗</span><span class="section-title">Compatibility Modes</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Compatibility modes define what schema changes are allowed when a new version is registered. The broker-side constraint — enforced by Schema Registry, not by Kafka itself.</p>
+
+  <table class="kv-table">
+    <tr><th>Mode</th><th>Rule</th><th>Can I read old messages with new schema?</th><th>Can old consumers read new messages?</th></tr>
+    <tr><td>BACKWARD (default)</td><td>New schema can read data written with old schema</td><td class="good">Yes</td><td class="warn">Not guaranteed</td></tr>
+    <tr><td>FORWARD</td><td>Old schema can read data written with new schema</td><td class="warn">Not guaranteed</td><td class="good">Yes</td></tr>
+    <tr><td>FULL</td><td>Both backward AND forward compatible</td><td class="good">Yes</td><td class="good">Yes</td></tr>
+    <tr><td>NONE</td><td>No compatibility check</td><td class="danger">No guarantee</td><td class="danger">No guarantee</td></tr>
+    <tr><td>BACKWARD_TRANSITIVE</td><td>Backward compatible with ALL previous versions</td><td class="good">Yes (all history)</td><td class="warn">Not guaranteed</td></tr>
+    <tr><td>FORWARD_TRANSITIVE</td><td>Forward compatible with ALL previous versions</td><td class="warn">Not guaranteed</td><td class="good">Yes (all history)</td></tr>
+    <tr><td>FULL_TRANSITIVE</td><td>Both backward and forward with ALL versions</td><td class="good">Yes (all history)</td><td class="good">Yes (all history)</td></tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>When to use which:</strong><br>
+    <strong>BACKWARD</strong> — Most common. You upgrade consumers first, then producers. New schema adds optional fields with defaults.<br>
+    <strong>FORWARD</strong> — Upgrade producers first, then consumers. Useful when old consumers must still work during rollout.<br>
+    <strong>FULL</strong> — Safest for long-running topics where you need both upgrade directions. Strictest constraints.<br>
+    <strong>_TRANSITIVE</strong> — Use when topic has long retention and consumers may be reading very old data. Prevents incompatibility with any historical schema version.<br>
+    <strong>NONE</strong> — Development only. Never in production financial systems.</div>
+  </div>
+
+  <div class="diagram">  BACKWARD compatibility allowed changes:
+  ✅ Add optional field WITH a default value
+  ✅ Delete a field (consumers ignore unknown fields)
+  ✅ Change field type (if compatible, e.g., int → long)
+  ❌ Add a required field with no default
+  ❌ Rename a field
+  ❌ Change field type incompatibly (string → int)
+  ❌ Delete an enum value used in existing data</div>
+</div>
+
+<!-- Schema Evolution -->
+<div class="section" id="evolution">
+  <div class="section-header"><span class="section-icon">🌱</span><span class="section-title">Schema Evolution Examples</span></div>
+
+  <div class="diagram">  AVRO SCHEMA EVOLUTION EXAMPLE:
+
+  Version 1 (original):
+  {
+    "type": "record",
+    "name": "Payment",
+    "fields": [
+      {"name": "id",     "type": "string"},
+      {"name": "amount", "type": "double"}
+    ]
+  }
+
+  Version 2 (backward compatible — added optional field with default):
+  {
+    "type": "record",
+    "name": "Payment",
+    "fields": [
+      {"name": "id",       "type": "string"},
+      {"name": "amount",   "type": "double"},
+      {"name": "currency", "type": "string",  "default": "USD"},  ← BACKWARD OK
+      {"name": "status",   "type": ["null","string"], "default": null} ← BACKWARD OK
+    ]
+  }
+
+  Version 3 (BACKWARD INCOMPATIBLE — fails SR check):
+  {
+    "type": "record",
+    "name": "Payment",
+    "fields": [
+      {"name": "payment_id", "type": "string"},  ← renamed "id" → BREAKS compatibility
+      {"name": "amount", "type": "string"}        ← changed double→string → BREAKS
+    ]
+  }</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Renaming fields in Avro:</strong> Avro doesn't support renames directly — it uses <code>aliases</code>. Add <code>"aliases":["old_name"]</code> to the new field definition. This tells the Avro library: "when reading old data with field 'old_name', map it to this field." Schema Registry still checks compatibility based on field names and aliases.</div>
+  </div>
+</div>
+
+<!-- Subject Naming -->
+<div class="section" id="subjects">
+  <div class="section-header"><span class="section-icon">🏷️</span><span class="section-title">Subject Naming Strategies</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">A "subject" is the name under which a schema version history is tracked in Schema Registry. The naming strategy determines how subject names map to topics and record types.</p>
+
+  <table class="kv-table">
+    <tr><th>Strategy</th><th>Subject Name Format</th><th>Use Case</th></tr>
+    <tr><td>TopicNameStrategy (default)</td><td><code>{topic}-value</code> / <code>{topic}-key</code></td><td>One schema per topic. Simple. Most common.</td></tr>
+    <tr><td>RecordNameStrategy</td><td><code>{fully.qualified.RecordName}</code></td><td>Same schema reused across multiple topics. Schema evolution is global, not per-topic.</td></tr>
+    <tr><td>TopicRecordNameStrategy</td><td><code>{topic}-{fully.qualified.RecordName}</code></td><td>Different evolution per topic even for same record type. Most flexible, most subjects.</td></tr>
+  </table>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Interview question:</strong> "Why would you use RecordNameStrategy?" — When you have a shared canonical model (e.g., <code>com.hsbc.Payment</code>) that flows through multiple Kafka topics (payments-raw, payments-validated, payments-enriched). You want one schema version history, not three. Change the schema once, all topics benefit. Downside: all topics must evolve together — no per-topic divergence.</div>
+  </div>
+</div>
+
+<!-- REST API -->
+<div class="section" id="api">
+  <div class="section-header"><span class="section-icon">🌐</span><span class="section-title">Schema Registry REST API</span></div>
+
+  <div class="diagram">  # List all subjects
+  GET /subjects
+
+  # List versions for a subject
+  GET /subjects/payments-value/versions
+
+  # Get schema by subject + version
+  GET /subjects/payments-value/versions/2
+
+  # Get latest schema
+  GET /subjects/payments-value/versions/latest
+
+  # Get schema by global ID
+  GET /schemas/ids/42
+
+  # Register new schema version (checks compatibility)
+  POST /subjects/payments-value/versions
+  Body: {"schema": "{\"type\":\"record\",\"name\":\"Payment\",...}"}
+  Response: {"id": 43}
+
+  # Check compatibility before registering
+  POST /compatibility/subjects/payments-value/versions/latest
+  Body: {"schema": "..."}
+  Response: {"is_compatible": true}
+
+  # Change compatibility mode for a subject
+  PUT /config/payments-value
+  Body: {"compatibility": "FULL_TRANSITIVE"}
+
+  # Delete a schema version (soft delete by default)
+  DELETE /subjects/payments-value/versions/2
+
+  # Hard delete (permanent, use with extreme caution)
+  DELETE /subjects/payments-value/versions/2?permanent=true</div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Hard delete is irreversible.</strong> If consumers are still reading messages with that schema ID, they'll get <code>SchemaNotFoundException</code> — runtime deserialization failures in production. Always soft-delete first and verify no active consumers reference the schema before hard deleting.</div>
+  </div>
+</div>
+
+<!-- High Availability -->
+<div class="section" id="ha">
+  <div class="section-header"><span class="section-icon">🛡️</span><span class="section-title">High Availability Setup</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Multi-Instance SR</h4>
+      <p>Run 2+ Schema Registry instances behind a load balancer. Only one is the <strong>leader</strong> (handles writes). Others are followers (serve reads, cached data). Leader is elected via Kafka consumer group protocol on the <code>_schemas</code> topic.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Leader vs Follower</h4>
+      <p>All write requests (schema registration) must go to the leader — followers return <code>HTTP 422 (Leader Not Available)</code> or redirect. Configure LB to forward writes to the master URL (configurable via <code>leader.eligibility</code>).</p>
+    </div>
+    <div class="concept-card">
+      <h4>Client Resilience</h4>
+      <p>Confluent SR clients cache schemas locally. If SR is down, producers/consumers can still use cached schemas. First-time schema registration will fail if SR is down — plan for SR HA as a dependency.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Security</h4>
+      <p>SR supports mTLS and HTTP Basic Auth. RBAC available in Confluent Platform (not community). In OSS: secure with a reverse proxy (nginx) enforcing auth. Protect the <code>DELETE</code> endpoints strictly.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Concepts &amp; Scenario Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Schema Registry is down. What happens to producers and consumers?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        <strong>Producers:</strong> First-time schema registration fails → <code>SerializationException</code>. But if the schema was previously registered and cached, the producer can continue using the cached schema ID — no SR call needed. New schemas cannot be registered until SR recovers.
+        <br><br>
+        <strong>Consumers:</strong> If schema ID is cached, deserialization continues normally. If a new schema ID is encountered (never seen before), the SR lookup fails → <code>SerializationException</code>.
+        <br><br>
+        <strong>SRE action:</strong> SR should be HA (2+ instances). If SR is completely down: stop new producers from sending (they'll fail anyway). Existing consumers continue on cached schemas. Prioritize SR recovery — it's a critical dependency for new deployments.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A team wants to add a new required field to the Payment schema. The topic has 6 months of data and hundreds of consumers. How do you approach this safely?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Adding a <strong>required field without a default is backward incompatible</strong> — old messages don't have it, so new consumers reading old messages would fail.
+        <br><br>
+        <strong>Safe approach:</strong>
+        <ol>
+          <li><strong>Make the field optional with a default</strong> (null or a sensible value). This is backward compatible — old consumers ignore it, new consumers get the default when reading old messages.</li>
+          <li><strong>Roll out new consumers first</strong> (with BACKWARD compatibility). They can read both old schema (field missing → use default) and new schema (field present).</li>
+          <li><strong>Roll out new producers</strong> — they start populating the new field.</li>
+          <li><strong>Once all old messages have expired</strong> (past retention period), if you truly need the field to be required, you can bump the schema again — but this is rarely necessary.</li>
+        </ol>
+        <strong>Never use NONE compatibility in production.</strong> If the team insists on a required field, create a new topic with the new schema and migrate producers/consumers.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Why does Schema Registry use Kafka as its storage backend instead of a traditional database?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Several advantages:
+        <ul>
+          <li><strong>No external dependency:</strong> If you already have Kafka, you don't need a separate DB to operate.</li>
+          <li><strong>Durability:</strong> The <code>_schemas</code> topic has replication — same durability guarantees as your Kafka cluster.</li>
+          <li><strong>Log compaction:</strong> Only latest schema version per key is retained — gives full history without unbounded growth.</li>
+          <li><strong>Multi-instance coordination:</strong> SR instances use the Kafka consumer group protocol for leader election — no need for ZooKeeper or etcd.</li>
+          <li><strong>Audit trail:</strong> The schema topic is an immutable log of all schema changes — naturally audit-friendly for regulated environments.</li>
+        </ul>
+        <strong>Downside:</strong> Bootstrap dependency — SR needs Kafka to start, but Kafka doesn't need SR. If Kafka is unavailable, SR can't start.
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        You find that the _schemas topic has 50,000 messages and Schema Registry is slow to start. What do you do?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Schema Registry reads the entire <code>_schemas</code> topic on startup to rebuild its in-memory cache. 50,000 messages is unusual — likely from developers registering and deleting schemas repeatedly, or from <code>RecordNameStrategy</code> creating many subjects.
+        <ul>
+          <li><strong>Verify compaction is working:</strong> The <code>_schemas</code> topic should be log-compacted. Check if the Kafka log cleaner is running and the topic has <code>cleanup.policy=compact</code>. If not set, messages accumulate without compaction.</li>
+          <li><strong>Soft-delete and hard-delete unused subjects:</strong> Clean up test/dev subjects that are no longer needed.</li>
+          <li><strong>Check for schema subject explosion:</strong> If using <code>TopicRecordNameStrategy</code> with many topics and record types, subjects multiply. Consider consolidating.</li>
+          <li><strong>Tune log cleaner:</strong> <code>log.cleaner.min.cleanable.ratio</code> and <code>log.cleaner.threads</code> on the broker hosting <code>_schemas</code>.</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

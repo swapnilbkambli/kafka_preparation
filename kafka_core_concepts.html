@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Core Concepts — Interview Prep</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #5b8df6;
+      --accent2: #7c5cbf;
+      --green: #3ecf8e;
+      --yellow: #f5a623;
+      --red: #e05252;
+      --text: #e2e8f0;
+      --muted: #7b859c;
+      --code-bg: #12151f;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+    }
+
+    /* Header */
+    header {
+      background: linear-gradient(135deg, #1a1d27 0%, #0d1020 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 24px 40px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    header a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+    }
+    header a:hover { color: var(--accent); }
+    .header-sep { color: var(--border); }
+    header h1 { font-size: 22px; font-weight: 700; color: #fff; }
+    .header-right {
+      margin-left: auto;
+      display: flex;
+      gap: 10px;
+    }
+    .pill {
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 20px;
+      padding: 3px 10px;
+    }
+    .pill-blue   { background: rgba(91,141,246,.15); color: var(--accent); }
+    .pill-green  { background: rgba(62,207,142,.15); color: var(--green); }
+
+    /* Layout */
+    .layout {
+      display: flex;
+      max-width: 1200px;
+      margin: 32px auto;
+      padding: 0 24px;
+      gap: 28px;
+    }
+
+    /* Sidebar TOC */
+    .toc {
+      width: 220px;
+      flex-shrink: 0;
+    }
+    .toc-inner {
+      position: sticky;
+      top: 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+    .toc h3 {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .toc a {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 5px 0;
+      border-left: 2px solid transparent;
+      padding-left: 10px;
+      transition: color .15s, border-color .15s;
+    }
+    .toc a:hover { color: var(--accent); border-color: var(--accent); }
+    .toc .toc-sub {
+      font-size: 12px;
+      padding-left: 20px;
+    }
+
+    /* Content */
+    .content { flex: 1; min-width: 0; }
+
+    /* Section */
+    .section {
+      margin-bottom: 48px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .section-icon { font-size: 22px; }
+    .section-title { font-size: 20px; font-weight: 700; color: #fff; }
+
+    /* Concept card */
+    .concept-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .concept-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+    }
+    .concept-card h4 {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .concept-card p {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+    .concept-card code {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 12px;
+      color: var(--green);
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    /* Q&A */
+    .qa-list { display: flex; flex-direction: column; gap: 16px; }
+    .qa-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .qa-q {
+      padding: 14px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #fff;
+      background: var(--surface2);
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .qa-q .q-badge {
+      flex-shrink: 0;
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .qa-a {
+      padding: 14px 18px;
+      font-size: 13.5px;
+      color: var(--muted);
+      line-height: 1.75;
+    }
+    .qa-a strong { color: var(--text); }
+    .qa-a ul {
+      margin: 8px 0 8px 18px;
+    }
+    .qa-a li { margin-bottom: 5px; }
+    .qa-a code {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 12px;
+      color: var(--green);
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+    }
+    .difficulty {
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 20px;
+      padding: 2px 8px;
+      margin-left: auto;
+    }
+    .d-basic    { background: rgba(62,207,142,.15); color: var(--green); }
+    .d-mid      { background: rgba(245,166,35,.15);  color: var(--yellow); }
+    .d-senior   { background: rgba(224,82,82,.15);   color: var(--red); }
+
+    /* Diagram box */
+    .diagram {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin: 20px 0;
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 13px;
+      color: #a8c4e0;
+      white-space: pre;
+      overflow-x: auto;
+      line-height: 1.6;
+    }
+
+    /* Key numbers table */
+    .kv-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 13px;
+    }
+    .kv-table th {
+      background: var(--surface2);
+      padding: 10px 14px;
+      text-align: left;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: .5px;
+      border-bottom: 1px solid var(--border);
+    }
+    .kv-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      vertical-align: top;
+    }
+    .kv-table tr:last-child td { border-bottom: none; }
+    .kv-table td:first-child { color: var(--accent); font-weight: 600; }
+    .kv-table td code {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 12px;
+      color: var(--green);
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+    }
+    .kv-table .warn { color: var(--yellow); }
+
+    /* Callout */
+    .callout {
+      border-radius: var(--radius);
+      padding: 14px 18px;
+      margin: 16px 0;
+      font-size: 13px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+    }
+    .callout-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+    .callout-body { color: var(--muted); line-height: 1.65; }
+    .callout-body strong { color: var(--text); }
+    .callout.info   { background: rgba(91,141,246,.08); border: 1px solid rgba(91,141,246,.25); }
+    .callout.warn   { background: rgba(245,166,35,.08); border: 1px solid rgba(245,166,35,.25); }
+    .callout.tip    { background: rgba(62,207,142,.08); border: 1px solid rgba(62,207,142,.25); }
+
+    @media (max-width: 768px) {
+      .layout { flex-direction: column; }
+      .toc { width: 100%; }
+      .toc-inner { position: static; }
+      header { flex-wrap: wrap; padding: 16px 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <a href="index.html">← Index</a>
+  <span class="header-sep">/</span>
+  <h1>⚙️ Kafka Core Concepts</h1>
+  <div class="header-right">
+    <span class="pill pill-blue">Concepts</span>
+    <span class="pill pill-green">In Progress</span>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- TOC -->
+  <nav class="toc">
+    <div class="toc-inner">
+      <h3>On This Page</h3>
+      <a href="#building-blocks">Building Blocks</a>
+      <a href="#replication">Replication &amp; ISR</a>
+      <a href="#consumers">Consumers &amp; Offsets</a>
+      <a href="#zk-kraft">ZooKeeper vs KRaft</a>
+      <a href="#guarantees">Delivery Guarantees</a>
+      <a href="#qa">Interview Q&amp;A</a>
+      <a href="#qa" class="toc-sub">— Basic</a>
+      <a href="#qa-mid" class="toc-sub">— Mid-level</a>
+      <a href="#qa-senior" class="toc-sub">— Senior/SRE</a>
+    </div>
+  </nav>
+
+  <!-- Content -->
+  <div class="content">
+
+    <!-- ─── Building Blocks ─────────────────────────────── -->
+    <div class="section" id="building-blocks">
+      <div class="section-header">
+        <span class="section-icon">🧱</span>
+        <span class="section-title">Kafka Building Blocks</span>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-card">
+          <h4>Broker</h4>
+          <p>A single Kafka server process. Stores data, serves reads/writes. A cluster is 3+ brokers. One broker is the <strong>Controller</strong> (manages metadata, leader elections).</p>
+        </div>
+        <div class="concept-card">
+          <h4>Topic</h4>
+          <p>A named log/stream. Producers write to it; consumers read from it. Topics are split into <strong>partitions</strong> for parallelism and scalability.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Partition</h4>
+          <p>An ordered, immutable sequence of records. The unit of parallelism. Each partition lives on one broker (leader) and is replicated to others (followers). Records within a partition are ordered; across partitions they are not.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Offset</h4>
+          <p>A sequential ID for each record within a partition. Consumers track offsets to know where they left off. Stored in the internal topic <code>__consumer_offsets</code>.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Producer</h4>
+          <p>Publishes records to topics. Routes records to partitions via a <strong>partitioner</strong> (key hash by default, or round-robin if no key). Controls durability via <code>acks</code>.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Consumer Group</h4>
+          <p>One or more consumers sharing a <code>group.id</code>. Each partition is consumed by exactly one member. Enables horizontal scaling — add consumers to scale out reads.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Record / Message</h4>
+          <p>The unit of data: <strong>key</strong> (optional, used for partitioning), <strong>value</strong> (payload), <strong>headers</strong> (metadata), and <strong>timestamp</strong>.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Log Segment</h4>
+          <p>Partitions are stored as <strong>log segments</strong> on disk — rolling files of fixed size or time window (e.g., 1 GB / 7 days). Active segment is appended to; older ones are eligible for retention/compaction.</p>
+        </div>
+      </div>
+
+      <div class="diagram">
+  TOPIC: orders  (6 partitions, RF=3)
+
+  Broker 1 ──────────────────────────────
+    P0 [Leader]   P1 [Follower] P4 [Follower]
+
+  Broker 2 ──────────────────────────────
+    P1 [Leader]   P2 [Follower] P5 [Follower]
+
+  Broker 3 ──────────────────────────────
+    P2 [Leader]   P0 [Follower] P3 [Leader]
+
+  Consumer Group A:
+    Consumer-1 → P0, P1
+    Consumer-2 → P2, P3
+    Consumer-3 → P4, P5</div>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body"><strong>Key rule:</strong> You cannot have more consumers in a group than there are partitions. Extra consumers sit idle. This is why partition count planning at topic creation is critical — you can increase partitions but never decrease them.</div>
+      </div>
+    </div>
+
+    <!-- ─── Replication & ISR ───────────────────────────── -->
+    <div class="section" id="replication">
+      <div class="section-header">
+        <span class="section-icon">🔁</span>
+        <span class="section-title">Replication &amp; ISR</span>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-card">
+          <h4>Replication Factor (RF)</h4>
+          <p>How many copies of each partition exist. RF=3 means one leader + two followers. Industry standard for production. RF=1 is no fault tolerance.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Leader</h4>
+          <p>The one broker that handles all reads and writes for a partition. Elected per partition. Followers only replicate from the leader.</p>
+        </div>
+        <div class="concept-card">
+          <h4>ISR (In-Sync Replicas)</h4>
+          <p>Replicas that are fully caught up with the leader (within <code>replica.lag.time.max.ms</code>). Only ISR members are eligible to be elected as leader on failure.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Under-Replicated Partitions</h4>
+          <p>Partitions where ISR count &lt; RF. A critical alert signal — means some replicas are lagging or a broker is down. Check metric <code>UnderReplicatedPartitions</code>.</p>
+        </div>
+      </div>
+
+      <table class="kv-table">
+        <tr><th>Config</th><th>What it controls</th><th>Production recommendation</th></tr>
+        <tr><td><code>replication.factor</code></td><td>Number of replicas per partition</td><td>3 (tolerates 1 broker failure)</td></tr>
+        <tr><td><code>min.insync.replicas</code></td><td>Minimum ISR required to accept writes</td><td>2 (use with <code>acks=all</code>)</td></tr>
+        <tr><td><code>replica.lag.time.max.ms</code></td><td>Max time a follower can lag before removed from ISR</td><td>30,000 ms default</td></tr>
+        <tr><td><code>unclean.leader.election.enable</code></td><td>Allow out-of-sync replica to become leader</td><td class="warn">false — prevents data loss</td></tr>
+      </table>
+
+      <div class="callout warn">
+        <span class="callout-icon">⚠️</span>
+        <div class="callout-body"><strong>Critical for SRE interviews:</strong> If ISR shrinks to 1 (only the leader) and you have <code>min.insync.replicas=2</code>, producers will get <code>NotEnoughReplicasException</code> — the cluster rejects writes to protect durability. This is expected behavior, not a bug. Knowing this distinction matters.</div>
+      </div>
+    </div>
+
+    <!-- ─── Consumers & Offsets ────────────────────────── -->
+    <div class="section" id="consumers">
+      <div class="section-header">
+        <span class="section-icon">📥</span>
+        <span class="section-title">Consumers, Consumer Groups &amp; Offsets</span>
+      </div>
+
+      <div class="concept-grid">
+        <div class="concept-card">
+          <h4>Offset Commit</h4>
+          <p>Consumers commit offsets to <code>__consumer_offsets</code> to record progress. Auto-commit (<code>enable.auto.commit=true</code>) can cause duplicates or data loss; manual commit gives control.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Rebalance</h4>
+          <p>When a consumer joins/leaves/crashes, Kafka re-assigns partitions across the group. During rebalance, <strong>all consumption stops</strong>. Minimize with <code>session.timeout.ms</code> and <code>max.poll.interval.ms</code>.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Consumer Lag</h4>
+          <p>Difference between the latest offset (producer end) and the consumer's committed offset. High lag = consumer falling behind. Key SRE alert metric.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Cooperative Rebalancing</h4>
+          <p>Introduced in Kafka 2.4 (<code>CooperativeStickyAssignor</code>). Only re-assigns partitions that need to move — consumers keep others during rebalance, eliminating the "stop the world" pause.</p>
+        </div>
+        <div class="concept-card">
+          <h4>auto.offset.reset</h4>
+          <p><code>earliest</code> — start from the oldest record when no committed offset exists.<br><code>latest</code> — start from new records only. Choose based on your data loss vs replay tolerance.</p>
+        </div>
+        <div class="concept-card">
+          <h4>Partition Assignment</h4>
+          <p>Strategies: <strong>RangeAssignor</strong> (default), <strong>RoundRobinAssignor</strong>, <strong>StickyAssignor</strong>, <strong>CooperativeStickyAssignor</strong>. Sticky minimizes partition movement during rebalances.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── ZooKeeper vs KRaft ─────────────────────────── -->
+    <div class="section" id="zk-kraft">
+      <div class="section-header">
+        <span class="section-icon">🗳️</span>
+        <span class="section-title">ZooKeeper vs KRaft</span>
+      </div>
+
+      <table class="kv-table">
+        <tr><th>Aspect</th><th>ZooKeeper Mode (legacy)</th><th>KRaft Mode (Kafka ≥ 3.3)</th></tr>
+        <tr><td>Metadata storage</td><td>External ZooKeeper ensemble</td><td>Internal Raft-based metadata log</td></tr>
+        <tr><td>Controller</td><td>One broker elected via ZooKeeper</td><td>Quorum of 3+ KRaft controllers (can be dedicated or co-located)</td></tr>
+        <tr><td>Partition limit</td><td>~200k partitions (ZK bottleneck)</td><td>Millions of partitions</td></tr>
+        <tr><td>Failover speed</td><td>Slow (ZK session timeout ~6s)</td><td>Fast (milliseconds, no ZK round-trip)</td></tr>
+        <tr><td>Ops complexity</td><td>Two systems to manage</td><td>One system, simpler</td></tr>
+        <tr><td>Production ready</td><td>Yes (but deprecated)</td><td>Yes from Kafka 3.3+, ZK removed in Kafka 4.0</td></tr>
+      </table>
+
+      <div class="callout tip">
+        <span class="callout-icon">✅</span>
+        <div class="callout-body"><strong>Interview tip:</strong> Mention that ZooKeeper is removed in Kafka 4.0. If HSBC runs older clusters, they may still be on ZK — be ready to discuss migration path. KRaft uses a <code>__cluster_metadata</code> topic for Raft log, and the active controller is elected via Raft consensus, not ZK ephemeral nodes.</div>
+      </div>
+    </div>
+
+    <!-- ─── Delivery Guarantees ───────────────────────── -->
+    <div class="section" id="guarantees">
+      <div class="section-header">
+        <span class="section-icon">📬</span>
+        <span class="section-title">Delivery Guarantees</span>
+      </div>
+
+      <table class="kv-table">
+        <tr><th>Guarantee</th><th>Producer config</th><th>Consumer requirement</th><th>Trade-off</th></tr>
+        <tr>
+          <td>At-most-once</td>
+          <td><code>acks=0</code>, no retries</td>
+          <td>Auto-commit before processing</td>
+          <td>Fastest. Data loss possible.</td>
+        </tr>
+        <tr>
+          <td>At-least-once</td>
+          <td><code>acks=all</code>, retries &gt; 0</td>
+          <td>Commit after processing</td>
+          <td>No loss. Duplicates on retry.</td>
+        </tr>
+        <tr>
+          <td>Exactly-once (EOS)</td>
+          <td><code>enable.idempotence=true</code> + transactions</td>
+          <td>Read-committed isolation</td>
+          <td>No loss, no duplicates. ~20% perf cost.</td>
+        </tr>
+      </table>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body"><strong>Idempotent producer</strong> assigns each record a sequence number + producer ID. Broker deduplicates retries within a session. <strong>Transactions</strong> extend this across multiple partitions/topics atomically — used in Kafka Streams and Flink for EOS pipelines.</div>
+      </div>
+    </div>
+
+    <!-- ─── Q&A ──────────────────────────────────────── -->
+    <div class="section" id="qa">
+      <div class="section-header">
+        <span class="section-icon">🎯</span>
+        <span class="section-title">Interview Q&amp;A — Basic</span>
+      </div>
+      <div class="qa-list">
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            What is a Kafka partition and why does it matter?
+            <span class="difficulty d-basic">Basic</span>
+          </div>
+          <div class="qa-a">
+            A partition is an <strong>ordered, append-only log</strong> — the fundamental unit of storage and parallelism in Kafka. It matters because:
+            <ul>
+              <li><strong>Scalability:</strong> More partitions = more consumers in parallel = higher throughput.</li>
+              <li><strong>Ordering:</strong> Order is guaranteed within a partition (via key-based routing), not across them.</li>
+              <li><strong>Replication:</strong> Each partition is replicated independently, giving fault tolerance at the partition level.</li>
+            </ul>
+            The tradeoff: more partitions = more file handles, memory, and leader election overhead. <strong>Rule of thumb:</strong> start with 3–6x the number of brokers; don't over-partition early.
+          </div>
+        </div>
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            Explain ISR and why it matters for durability.
+            <span class="difficulty d-basic">Basic</span>
+          </div>
+          <div class="qa-a">
+            ISR (In-Sync Replicas) is the set of replicas fully caught up with the leader. When a producer uses <code>acks=all</code>, Kafka waits for all ISR members to acknowledge the write before confirming success.
+            <ul>
+              <li>A follower is removed from ISR if it hasn't fetched from the leader within <code>replica.lag.time.max.ms</code>.</li>
+              <li>Only ISR members can become the new leader on failover — this prevents data loss.</li>
+              <li>Setting <code>unclean.leader.election.enable=false</code> enforces this — if no ISR member is available, the partition goes offline rather than electing a stale replica.</li>
+            </ul>
+            <strong>In a bank's context</strong> (like HSBC), you always want <code>acks=all</code> + <code>min.insync.replicas=2</code> + <code>unclean.leader.election.enable=false</code> for financial data.
+          </div>
+        </div>
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            What happens during a consumer group rebalance?
+            <span class="difficulty d-basic">Basic</span>
+          </div>
+          <div class="qa-a">
+            A rebalance is triggered when a consumer <strong>joins, leaves, or crashes</strong>, or when partitions are added to a topic.
+            <ul>
+              <li>The <strong>Group Coordinator</strong> (a broker) orchestrates it.</li>
+              <li>In the classic (eager) protocol: all consumers stop consumption, revoke their partitions, rejoin, and get new assignments — causing a full stop-the-world pause.</li>
+              <li>In the <strong>cooperative/incremental</strong> protocol (Kafka 2.4+): only the affected partitions are revoked and reassigned; others continue normally.</li>
+            </ul>
+            <strong>SRE concern:</strong> Frequent rebalances cause consumer lag spikes. Root causes: long GC pauses, slow <code>poll()</code> loops, network issues. Tune <code>max.poll.interval.ms</code> and <code>session.timeout.ms</code> accordingly.
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Q&A Mid -->
+    <div class="section" id="qa-mid">
+      <div class="section-header">
+        <span class="section-icon">🎯</span>
+        <span class="section-title">Interview Q&amp;A — Mid-Level</span>
+      </div>
+      <div class="qa-list">
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            How does Kafka achieve high throughput on a single broker?
+            <span class="difficulty d-mid">Mid</span>
+          </div>
+          <div class="qa-a">
+            Kafka is designed around OS primitives that are extremely fast:
+            <ul>
+              <li><strong>Sequential disk I/O:</strong> Appending to a log is orders of magnitude faster than random writes. Kafka never modifies records in place.</li>
+              <li><strong>Page cache:</strong> Kafka relies on the OS page cache instead of JVM heap. Recent data is served from RAM; older data is read from disk.</li>
+              <li><strong>Zero-copy:</strong> Uses <code>sendfile()</code> syscall — data is transferred from page cache to network socket without copying to userspace. Hugely reduces CPU overhead for consumers.</li>
+              <li><strong>Batching:</strong> Producers batch records (<code>batch.size</code>, <code>linger.ms</code>); brokers write batches; consumers fetch batches. Fewer round-trips, better compression ratios.</li>
+              <li><strong>Compression:</strong> Batches are compressed as a unit (LZ4, Snappy, ZSTD), further reducing I/O and network.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            What is log compaction and when would you use it?
+            <span class="difficulty d-mid">Mid</span>
+          </div>
+          <div class="qa-a">
+            Log compaction is a retention policy where Kafka keeps <strong>the latest value for each key</strong> in a partition, rather than deleting data after a time/size window.
+            <ul>
+              <li>Enables <strong>changelog / event-sourcing</strong> patterns: consumers can rebuild state by replaying a compacted topic (e.g., a product catalog, user preferences).</li>
+              <li>Records with a <code>null</code> value (tombstones) signal deletion — the key is eventually removed during compaction.</li>
+              <li>Compaction runs in the background via dedicated cleaner threads (<code>log.cleaner.threads</code>).</li>
+              <li>Compacted topics always retain the <strong>active segment</strong> (head) untouched; only older closed segments are compacted.</li>
+            </ul>
+            <strong>Use cases:</strong> Kafka Streams changelog topics, database CDC (Change Data Capture) snapshots, config stores.
+          </div>
+        </div>
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            You see <code>UnderReplicatedPartitions &gt; 0</code> on a broker. Walk me through your investigation.
+            <span class="difficulty d-mid">Mid</span>
+          </div>
+          <div class="qa-a">
+            This is a critical alert — some partitions have fewer in-sync replicas than expected.
+            <ul>
+              <li><strong>Step 1 — Identify scope:</strong> <code>kafka-topics.sh --describe --under-replicated-partitions</code> — list affected partitions and which broker is lagging.</li>
+              <li><strong>Step 2 — Check broker health:</strong> Is the lagging broker's process running? Network reachable? GC logs showing long pauses?</li>
+              <li><strong>Step 3 — Check disk:</strong> <code>df -h</code> on the broker. Kafka stops replication if a broker's disk is full.</li>
+              <li><strong>Step 4 — Check replica lag:</strong> JMX metric <code>ReplicaFetcherManager.MaxLag</code>. If lag is rising, the follower is not keeping up — check CPU, I/O, network.</li>
+              <li><strong>Step 5 — Broker just restarted?</strong> Lag is expected during catch-up — monitor for convergence. If it doesn't converge, investigate throttling (<code>replica.fetch.max.bytes</code>).</li>
+              <li><strong>Resolution:</strong> Fix the root cause (disk, network, GC). In extreme cases, run preferred replica election to rebalance leaders after recovery.</li>
+            </ul>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Q&A Senior -->
+    <div class="section" id="qa-senior">
+      <div class="section-header">
+        <span class="section-icon">🎯</span>
+        <span class="section-title">Interview Q&amp;A — Senior / SRE Level</span>
+      </div>
+      <div class="qa-list">
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            How would you handle a broker that keeps getting removed from the cluster due to frequent GC pauses?
+            <span class="difficulty d-senior">Senior</span>
+          </div>
+          <div class="qa-a">
+            This is a JVM tuning + Kafka configuration problem.
+            <ul>
+              <li><strong>Short-term:</strong> Increase <code>replica.lag.time.max.ms</code> to tolerate longer pauses without ISR shrinkage — buys time without dropping the follower from ISR repeatedly.</li>
+              <li><strong>Root cause — JVM:</strong> Switch from CMS to <strong>G1GC</strong> (default since JDK 9) or <strong>ZGC</strong> for sub-10ms pauses. Set <code>-XX:MaxGCPauseMillis=20</code>. Tune heap: Kafka brokers typically need 4–8 GB heap, not more — the rest of RAM should be free for OS page cache.</li>
+              <li><strong>Heap sizing mistake:</strong> Giving the JVM too much heap causes longer GC cycles. Kafka's performance depends on the OS page cache, not JVM heap. A 32 GB box should have 6 GB JVM heap and 26 GB for page cache.</li>
+              <li><strong>Monitoring:</strong> Alert on <code>jvm.gc.collection_time</code> and <code>kafka.server:type=ReplicaFetcherManager,name=MaxLag</code> together.</li>
+              <li><strong>Long-term:</strong> Profile heap allocations — large message sizes or high partition counts can amplify GC pressure.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="qa-item">
+          <div class="qa-q">
+            <span class="q-badge">Q</span>
+            A financial topic requires strict ordering and no data loss. How do you configure it end-to-end?
+            <span class="difficulty d-senior">Senior</span>
+          </div>
+          <div class="qa-a">
+            <strong>Producer side:</strong>
+            <ul>
+              <li><code>acks=all</code> — wait for all ISR to acknowledge.</li>
+              <li><code>enable.idempotence=true</code> — deduplicates retries on the broker side.</li>
+              <li><code>max.in.flight.requests.per.connection=1</code> — with idempotence enabled you can use up to 5, but set to 1 if ordering is critical and idempotence is off (legacy).</li>
+              <li><code>retries=Integer.MAX_VALUE</code> + <code>delivery.timeout.ms</code> appropriate for business SLA.</li>
+              <li>Use a <strong>single partition key</strong> per entity (e.g., account ID) to guarantee per-entity ordering.</li>
+            </ul>
+            <strong>Broker / topic side:</strong>
+            <ul>
+              <li><code>replication.factor=3</code>, <code>min.insync.replicas=2</code>.</li>
+              <li><code>unclean.leader.election.enable=false</code>.</li>
+              <li>Retention policy aligned with business audit requirements (e.g., 7 years for financial records — use tiered storage or compaction).</li>
+            </ul>
+            <strong>Consumer side:</strong>
+            <ul>
+              <li>Commit offsets <strong>after</strong> successful processing (manual commit).</li>
+              <li>Idempotent consumer logic (handle replays gracefully).</li>
+              <li>Use transactions if writing results to another Kafka topic — ensures read-process-write atomicity.</li>
+            </ul>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /layout -->
+
+</body>
+</html>

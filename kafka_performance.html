@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Performance & Tuning — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>📈 Performance &amp; Tuning</h1>
+  <div class="header-right"><span class="pill pill-green">Ops</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#producer-tuning">Producer Tuning</a>
+  <a href="#consumer-tuning">Consumer Tuning</a>
+  <a href="#broker-tuning">Broker Tuning</a>
+  <a href="#jvm-tuning">JVM Tuning</a>
+  <a href="#os-tuning">OS &amp; Disk Tuning</a>
+  <a href="#benchmarking">Benchmarking Tools</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Producer Tuning -->
+<div class="section" id="producer-tuning">
+  <div class="section-header"><span class="section-icon">📤</span><span class="section-title">Producer Tuning</span></div>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">Producer performance is about the throughput-latency tradeoff. Batching increases throughput but adds latency. Compression reduces network I/O but adds CPU. Tune based on your SLA.</p>
+
+  <table class="kv-table">
+    <tr><th>Config</th><th>Default</th><th>Throughput-Optimized</th><th>Latency-Optimized</th></tr>
+    <tr><td><code>linger.ms</code></td><td>0</td><td>20–100ms</td><td>0 (send immediately)</td></tr>
+    <tr><td><code>batch.size</code></td><td>16384 (16KB)</td><td>65536–524288 (64KB–512KB)</td><td>16384 or lower</td></tr>
+    <tr><td><code>buffer.memory</code></td><td>33554432 (32MB)</td><td>67108864–268435456 (64–256MB)</td><td>Default sufficient</td></tr>
+    <tr><td><code>compression.type</code></td><td>none</td><td>lz4 (fast) or zstd (best ratio)</td><td>none (zero CPU)</td></tr>
+    <tr><td><code>acks</code></td><td>all</td><td>1 (leader only, faster but less safe)</td><td>0 (fire-and-forget, fastest)</td></tr>
+    <tr><td><code>max.in.flight.requests.per.connection</code></td><td>5</td><td>5 (with idempotence)</td><td>1 (strict ordering, slower)</td></tr>
+    <tr><td><code>retries</code></td><td>2147483647</td><td>Same (rely on delivery.timeout.ms)</td><td>Same</td></tr>
+    <tr><td><code>delivery.timeout.ms</code></td><td>120000ms</td><td>Set to your SLA max</td><td>Set to your SLA max</td></tr>
+  </table>
+
+  <div class="diagram">  BATCHING BEHAVIOR:
+  ──────────────────────────────────────────────────────────────────
+  Time ──────────────────────────────────────────────►
+       │            linger.ms=0                        │
+  Rec1 │─send────►                                    │
+  Rec2 │  ─send────►                                  │
+  Rec3 │    ─send────►                                │
+       │ (3 separate requests, low latency, low batch)│
+                                                      │
+       │            linger.ms=20ms                    │
+  Rec1 ├──────────────────────────────►batch───send──►│
+  Rec2 ├──────────────────────────────►batch───send──►│
+  Rec3 ├──────────────────────────────►batch───send──►│
+       │ (1 request after 20ms wait, higher throughput)│
+
+  COMPRESSION RATIO COMPARISON (typical Kafka JSON data):
+  LZ4:   ~2-3x compression, ~10MB/s CPU overhead per GB → best for throughput
+  Snappy: ~2x compression, moderate CPU → balanced
+  ZSTD:  ~3-4x compression, higher CPU → best ratio, good for archival
+  GZIP:  ~4x compression, high CPU latency → avoid for real-time</div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Rule of thumb for financial systems:</strong> Use <code>acks=all</code>, <code>enable.idempotence=true</code>, <code>linger.ms=5</code>, <code>batch.size=65536</code>, <code>compression.type=lz4</code>. This gives good throughput while maintaining durability. Only relax <code>acks</code> for non-critical analytics topics.</div>
+  </div>
+</div>
+
+<!-- Consumer Tuning -->
+<div class="section" id="consumer-tuning">
+  <div class="section-header"><span class="section-icon">📥</span><span class="section-title">Consumer Tuning</span></div>
+
+  <table class="kv-table">
+    <tr><th>Config</th><th>Default</th><th>High-Throughput</th><th>Low-Latency</th></tr>
+    <tr><td><code>fetch.min.bytes</code></td><td>1</td><td>65536 (64KB) — broker waits to accumulate</td><td>1 (return immediately)</td></tr>
+    <tr><td><code>fetch.max.wait.ms</code></td><td>500</td><td>500 (let broker accumulate)</td><td>50–100ms</td></tr>
+    <tr><td><code>max.partition.fetch.bytes</code></td><td>1048576 (1MB)</td><td>4–8MB per partition</td><td>Default sufficient</td></tr>
+    <tr><td><code>fetch.max.bytes</code></td><td>52428800 (50MB)</td><td>104857600 (100MB)</td><td>Default sufficient</td></tr>
+    <tr><td><code>max.poll.records</code></td><td>500</td><td>1000–5000 (if processing is fast)</td><td>100–200 (if processing is slow)</td></tr>
+    <tr><td><code>max.poll.interval.ms</code></td><td>300000</td><td>Increase if batch processing is slow</td><td>Default sufficient</td></tr>
+    <tr><td><code>session.timeout.ms</code></td><td>45000</td><td>45000–60000 (for slow processing)</td><td>Default sufficient</td></tr>
+  </table>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Scaling consumer throughput:</strong>
+    1. Add more consumers (up to partition count)<br>
+    2. Increase <code>max.poll.records</code> + batch process downstream writes<br>
+    3. Process records in parallel within a consumer (careful with ordering)<br>
+    4. Increase partition count (requires new topic or future planning)<br>
+    5. Improve downstream throughput (faster DB, async writes, connection pooling)</div>
+  </div>
+</div>
+
+<!-- Broker Tuning -->
+<div class="section" id="broker-tuning">
+  <div class="section-header"><span class="section-icon">⚙️</span><span class="section-title">Broker Tuning</span></div>
+
+  <table class="kv-table">
+    <tr><th>Config</th><th>Default</th><th>Guidance</th></tr>
+    <tr><td><code>num.io.threads</code></td><td>8</td><td>Match to number of data disks. 8 for 1 disk, 16–24 for multi-disk RAID or JBOD. Don't over-provision — more threads = more context switching.</td></tr>
+    <tr><td><code>num.network.threads</code></td><td>3</td><td>Increase for high-connection brokers. 4–6 for &gt;10K active connections. Monitor <code>NetworkProcessorAvgIdlePercent</code>.</td></tr>
+    <tr><td><code>num.replica.fetchers</code></td><td>1</td><td>Increase for faster replication. 4–8 for large clusters. More fetchers = faster ISR recovery after broker restart.</td></tr>
+    <tr><td><code>socket.send.buffer.bytes</code></td><td>102400</td><td>Increase to 1048576 (1MB) for high-bandwidth networks or high-latency links (cross-DC).</td></tr>
+    <tr><td><code>socket.receive.buffer.bytes</code></td><td>102400</td><td>Same — increase for burst absorption.</td></tr>
+    <tr><td><code>log.flush.interval.messages</code></td><td>Long.MAX_VALUE</td><td>Keep as default — let OS manage page cache flush. Explicit flush reduces throughput with minimal durability benefit (replication provides durability).</td></tr>
+    <tr><td><code>log.segment.bytes</code></td><td>1073741824 (1GB)</td><td>1GB is good. Smaller segments = more files (overhead). Larger = slower deletion.</td></tr>
+    <tr><td><code>message.max.bytes</code></td><td>1048588 (~1MB)</td><td>Increase if sending large messages. Must match <code>max.partition.fetch.bytes</code> on consumers and <code>replica.fetch.max.bytes</code> on brokers.</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Large messages are an anti-pattern.</strong> Messages over 1MB increase latency (larger fetch responses, more GC), reduce throughput (fewer messages per batch), and complicate memory management. If you need large payloads: store the payload in object storage (S3) and send only a pointer (URL/key) in Kafka. This is the "claim check" pattern.</div>
+  </div>
+</div>
+
+<!-- JVM Tuning -->
+<div class="section" id="jvm-tuning">
+  <div class="section-header"><span class="section-icon">☕</span><span class="section-title">JVM Tuning</span></div>
+
+  <div class="diagram">  RECOMMENDED JVM FLAGS FOR KAFKA BROKER (kafka-server-start.sh):
+  ──────────────────────────────────────────────────────────────────
+  export KAFKA_HEAP_OPTS="-Xmx6g -Xms6g"       # Fixed heap: 6GB
+                                                 # On 32GB server: 6GB JVM + 26GB page cache
+                                                 # DO NOT give broker 16GB+ heap
+
+  export KAFKA_JVM_PERFORMANCE_OPTS="
+    -server
+    -XX:+UseG1GC                                 # G1GC: low-pause, generational
+    -XX:MaxGCPauseMillis=20                      # Target max GC pause: 20ms
+    -XX:InitiatingHeapOccupancyPercent=35        # Start G1 concurrent GC at 35% full
+    -XX:+ExplicitGCInvokesConcurrent             # System.gc() uses concurrent GC
+    -XX:+DisableExplicitGC                        # Or disable explicit GC entirely
+    -XX:G1HeapRegionSize=16m                     # Larger regions for large objects
+    -Djava.awt.headless=true
+    -Dcom.sun.jndi.rmiURLParsing=legacy"         # Security fix
+
+  FOR ZGC (JDK 15+, for sub-millisecond pauses):
+    -XX:+UseZGC
+    -XX:SoftMaxHeapSize=5g                       # Keep 1GB headroom for ZGC overhead
+    Note: ZGC trades slightly higher CPU for much lower pause times.
+          Use when GC pauses cause ZK session expiry issues.</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Why Small Heap for Brokers</h4>
+      <p>Kafka's performance depends on the OS page cache (kernel memory) for hot data reads. Every GB you give the JVM is 1 GB less page cache. A broker with 6GB JVM heap and 26GB page cache outperforms one with 16GB heap and 16GB page cache for most workloads.</p>
+    </div>
+    <div class="concept-card">
+      <h4>GC Pause Consequences</h4>
+      <p>Long GC pauses on a broker: ZK session may expire → spurious controller re-election. Network threads and IO threads stall → request queue backs up → producer/consumer timeouts. G1GC's short concurrent pauses prevent these cascades.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Heap Sizing Rule</h4>
+      <p>Start with 4–6GB on a 32GB broker. Monitor GC frequency and pause times (<code>jstat -gcutil</code>). If Old gen fills up or GC frequency is high → increase heap by 1GB increments. Rarely need more than 8GB for standard workloads.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Producer / Consumer JVM</h4>
+      <p>Application-side producers and consumers: tune based on message throughput and object allocation. Monitor <code>bufferpool-wait-ratio</code>. If Kafka client classes are being GC'd: increase app heap. Separate Kafka client object pools from application objects.</p>
+    </div>
+  </div>
+</div>
+
+<!-- OS Tuning -->
+<div class="section" id="os-tuning">
+  <div class="section-header"><span class="section-icon">🐧</span><span class="section-title">OS &amp; Disk Tuning</span></div>
+
+  <div class="diagram">  LINUX OS TUNING FOR KAFKA BROKERS:
+  ──────────────────────────────────────────────────────────────────
+
+  # File descriptor limits (Kafka opens many files — one per segment)
+  /etc/security/limits.conf:
+    kafka soft nofile 128000
+    kafka hard nofile 128000
+
+  # Virtual memory — prevent aggressive swapping (Kafka dislikes swap)
+  /etc/sysctl.conf:
+    vm.swappiness=1                    # Minimize swap usage
+    vm.dirty_ratio=80                  # Allow up to 80% dirty pages (write buffer)
+    vm.dirty_background_ratio=5        # Start background flush at 5% dirty pages
+
+  # Network buffers (for high-throughput Kafka)
+    net.core.rmem_max=134217728        # 128MB max receive buffer
+    net.core.wmem_max=134217728        # 128MB max send buffer
+    net.core.netdev_max_backlog=5000   # Larger NIC queue
+    net.ipv4.tcp_rmem=4096 65536 134217728
+    net.ipv4.tcp_wmem=4096 65536 134217728
+
+  # Disk I/O scheduler
+  # For NVMe SSDs: use none (kernel bypass)
+  echo none > /sys/block/nvme0n1/queue/scheduler
+  # For HDDs: use deadline or mq-deadline
+  echo mq-deadline > /sys/block/sda/queue/scheduler
+
+  # XFS filesystem (preferred over ext4 for Kafka)
+  # - Better performance with many small files (log segments + index files)
+  # - mkfs.xfs -f -l su=128k,sw=1 /dev/nvme0n1
+  # Mount with: noatime,nodiratime,nobarrier (improves I/O performance)
+
+  # Transparent Huge Pages — DISABLE for Kafka (causes GC latency spikes)
+  echo never > /sys/kernel/mm/transparent_hugepage/enabled</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Swap kills Kafka performance.</strong> When the OS swaps JVM memory to disk, Kafka broker stalls — similar to a GC pause but can last minutes. Set <code>vm.swappiness=1</code> (not 0 — that causes OOM killer to trigger instead). Monitor swap usage: if swap is non-zero, the broker is under memory pressure — increase RAM or reduce heap.</div>
+  </div>
+</div>
+
+<!-- Benchmarking -->
+<div class="section" id="benchmarking">
+  <div class="section-header"><span class="section-icon">🏎️</span><span class="section-title">Benchmarking Tools</span></div>
+
+  <div class="diagram">  KAFKA BUILT-IN BENCHMARK TOOLS:
+  ──────────────────────────────────────────────────────────────────
+
+  # Producer performance test
+  kafka-producer-perf-test.sh \
+    --topic benchmark-topic \
+    --num-records 10000000 \       # 10M records
+    --record-size 1024 \           # 1KB per record
+    --throughput -1 \              # -1 = unlimited (find max throughput)
+    --producer-props \
+      bootstrap.servers=broker:9092 \
+      acks=all \
+      linger.ms=5 \
+      batch.size=65536 \
+      compression.type=lz4
+
+  Sample output:
+  10000000 records sent, 450321.3 records/sec (440.0 MB/sec),
+  3.2 ms avg latency, 25.0 ms max latency, 2 ms 50th, 8 ms 95th,
+  15 ms 99th, 22 ms 99.9th
+
+  # Consumer performance test
+  kafka-consumer-perf-test.sh \
+    --topic benchmark-topic \
+    --messages 10000000 \
+    --bootstrap-server broker:9092 \
+    --fetch-size 4194304           # 4MB fetch
+
+  Sample output:
+  start.time   end.time     data.consumed.in.MB  nMsg.consumed  Fetch.MB.sec  nMsg.sec
+  2026-05-28   2026-05-28   9765.625             10000000       800.44        819500
+
+  # End-to-end latency test
+  kafka-e2e-latency.sh broker:9092 benchmark-topic 10000 1 --acks=all</div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>Benchmarking methodology:</strong><br>
+    1. Establish baseline with default configs<br>
+    2. Change ONE variable at a time<br>
+    3. Run each test for at least 5 minutes (steady state)<br>
+    4. Measure: throughput (MB/s), latency (p50, p95, p99, p999), CPU, disk I/O, network<br>
+    5. Test at different throughput levels — Kafka behavior changes significantly at saturation<br>
+    6. Always benchmark in an environment matching production (same hardware, same replication)</div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Performance Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Your team wants to achieve 1 million messages/second through Kafka. What's your approach?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        1M msg/sec at 1KB avg = 1 GB/sec. This requires careful design at every layer:
+        <ul>
+          <li><strong>Cluster sizing:</strong> 10+ brokers, NVMe SSDs (3+ GB/s throughput), 25Gb+ NICs. Kafka can sustain ~100–200 MB/s per broker sustainably; 1 GB/s total needs 5–10 brokers minimum.</li>
+          <li><strong>Topic design:</strong> 100+ partitions distributed evenly across brokers. Avoid hot partitions — use random or hash-based partitioning.</li>
+          <li><strong>Producer:</strong> Multiple producer instances (or threads). <code>linger.ms=20</code>, <code>batch.size=512KB</code>, <code>compression.type=lz4</code>, <code>acks=1</code> (if data loss tolerance exists). Multiple producer instances per topic.</li>
+          <li><strong>Broker:</strong> <code>num.io.threads=16</code>, <code>num.network.threads=6</code>, <code>num.replica.fetchers=4</code>. Disable explicit fsync (<code>log.flush.interval.messages=Long.MAX_VALUE</code>). Use JBOD (<code>log.dirs=/disk1,/disk2,...</code>) for parallel I/O.</li>
+          <li><strong>OS:</strong> Tuned network buffers, <code>vm.dirty_ratio=80</code>, io scheduler=none for NVMe, huge pages disabled.</li>
+          <li><strong>Verify:</strong> Run <code>kafka-producer-perf-test.sh --throughput -1</code> with realistic record sizes. Identify bottleneck (CPU, network, disk) before tuning further.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        Consumer throughput is 200MB/s but the broker disk can serve 1GB/s. What's limiting consumption?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Several possible bottlenecks between disk and consumer:
+        <ul>
+          <li><strong>Consumer count vs partition count:</strong> If 4 consumers on 4 partitions each get 50MB/s = 200MB/s. Add more consumers (up to partition count) and partition leaders on different brokers to parallelise.</li>
+          <li><strong>fetch.max.bytes:</strong> Default 50MB per fetch response. With 4 consumers: 4 × 50MB/s ceiling. Increase to 100MB+ and ensure Kafka buffers on client side are large enough.</li>
+          <li><strong>Network between broker and consumers:</strong> 4 consumers × 50MB/s = 200MB/s of actual network egress from broker. Check NIC utilization.</li>
+          <li><strong>Consumer processing throughput:</strong> If consumers can only process 200MB/s worth of data (deserialization, DB writes), they won't fetch faster regardless of broker capacity. Profile consumer CPU and downstream.</li>
+          <li><strong>Zero-copy disabled:</strong> Check if SSL is enabled between broker and consumer — SSL prevents zero-copy (sendfile), adds CPU for encryption. This can halve effective consumer throughput.</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>

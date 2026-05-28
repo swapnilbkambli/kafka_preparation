@@ -1,0 +1,60 @@
+Job Title  : Kafka Site Reliability Engineer (SRE) / Associate Director, Software Engineering Specialist
+Company    : HSBC
+Location   : Pune Division, Maharashtra, India (Hybrid)
+
+--------------------------------------------------------------------------------
+
+Some Careers Shine Brighter Than Others.
+
+If you're looking for a career that will help you stand out, join HSBC and fulfil
+your potential. Whether you want a career that could take you to the top, or simply
+take you in an exciting new direction, HSBC offers opportunities, support and rewards
+that will take you further.
+
+HSBC is one of the largest banking and financial services organizations in the world,
+with operations in 64 countries and territories. We aim to be where the growth is,
+enabling businesses to thrive and economies to prosper, and, ultimately, helping people
+to fulfil their hopes and realize their ambitions.
+
+We are currently seeking an experienced professional to join our team in the role of
+Associate Director, Software Engineering Specialist.
+
+--------------------------------------------------------------------------------
+
+IN THIS ROLE, YOU WILL
+
+  - Responsible for ensuring the reliability, performance, and scalability of our systems.
+  - Automate processes, and troubleshoot issues in production environments.
+  - Ensure the reliability, availability, and performance of the infrastructure platform.
+  - Collaborate in diagnosing and resolving Kafka infrastructure issues.
+  - Support the deployment, configuration, and maintenance of Kafka platform.
+  - Troubleshoot incidents, perform root cause analysis and implement reliability improvements.
+
+--------------------------------------------------------------------------------
+
+TO BE SUCCESSFUL, YOU WILL NEED
+
+  - Overall 10+ years of experience and preferably 7-10 years of experience working on Kafka.
+  - Familiarity with Kafka concepts and operations.
+  - Understanding of containerization and orchestration.
+  - Experience in Kubernetes is preferred.
+  - Strong analytical skills and a proactive approach to identifying and resolving issues.
+  - Familiarity with infrastructure as code. Proficiency in observability and logging tools.
+  - Experience with Unix administration skills.
+  - Ability to work effectively within a team. Weekend support required.
+
+--------------------------------------------------------------------------------
+
+You'll achieve more when you join HSBC.
+
+www.hsbc.com/careers
+
+HSBC is committed to building a culture where all employees are valued, respected and
+opinions count. We take pride in providing a workplace that fosters continuous professional
+development, flexible working and opportunities to grow within an inclusive and diverse
+environment. Personal data held by the Bank relating to employment applications will be
+used in accordance with our Privacy Statement, which is available on our website.
+
+Issued by HSBC Software Development India.
+
+--------------------------------------------------------------------------------

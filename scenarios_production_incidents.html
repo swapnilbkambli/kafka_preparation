@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Production Incident Scenarios — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🚨 Production Incident Scenarios</h1>
+  <div class="header-right"><span class="pill pill-yellow">Scenarios</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>Scenarios</h3>
+  <a href="#lag-spike">Consumer Lag Spike</a>
+  <a href="#disk-full">Broker Disk Full</a>
+  <a href="#leader-storm">Leader Election Storm</a>
+  <a href="#isr-shrink">ISR Shrinkage</a>
+  <a href="#data-loss">Data Loss Investigation</a>
+  <a href="#producer-fail">Producer Backpressure</a>
+  <a href="#network-part">Network Partition</a>
+  <a href="#controller-fail">Controller Failover</a>
+  <a href="#rebalance-loop">Rebalance Loop</a>
+  <a href="#lag-zero">Consumers at Zero Lag</a>
+  <hr style="border-color:var(--border);margin:8px 0"/>
+  <a href="#lag-broker-down">★ Lag from Broker Down + URP</a>
+  <a href="#high-cpu">★ High CPU on Brokers</a>
+  <a href="#rebalance-deep">★ Rebalance — Deep Parameter Dive</a>
+  <a href="#hero">🏆 Hero Scenario (Complex)</a>
+</div></nav>
+<div class="content">
+
+<div class="callout info">
+  <span class="callout-icon">💡</span>
+  <div class="callout-body"><strong>How to answer scenario questions:</strong> Structure your answer as: <strong>Symptoms → Immediate stabilization → Root cause investigation → Resolution → Post-incident prevention.</strong> Interviewers want to see structured thinking under pressure, not just the answer.</div>
+</div>
+
+<!-- Scenario 1: Consumer Lag Spike -->
+<div class="section" id="lag-spike">
+  <div class="section-header"><span class="section-icon">📈</span><span class="section-title">Scenario: Consumer Lag Spike — Payments Processor at 2M Lag</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Alert:</strong> "consumer_group_lag{group=payments-processor} &gt; 500000 for 5m"<br><strong>Impact:</strong> Payment confirmations delayed by 15 minutes. Business SLA breached.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Immediate: Triage scope</strong><br><code>kafka-consumer-groups.sh --describe --group payments-processor</code><br>Is lag on ALL partitions or specific ones? If specific partitions → likely a consumer task issue. If all → production spike or consumer group failure.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Check if consumers are alive</strong><br>Are consumers still running? Check app logs for errors. Check if the consumer group shows active members in the describe output. If no members → all consumers are down. If members present → consumers alive but slow.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Check for rebalance storm</strong><br>Consumer logs: "Rebalance in progress". JMX <code>rebalance-rate-per-hour</code>. Frequent rebalances = processing pauses. Check if any consumer is repeatedly joining/leaving (GC pause, slow processing exceeding <code>max.poll.interval.ms</code>).</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Check production side</strong><br>Has the producer throughput spiked? Check producer metrics or topic LOG-END-OFFSET growth rate. If producers suddenly sent 10x normal volume, consumers need time to catch up — this may self-resolve without action.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Scale consumers (fastest fix if consumers are healthy)</strong><br>With 12 partitions and 4 consumers: add 8 more consumers (up to 12 total). They join the group, partitions rebalance, throughput doubles/triples. Consider using cooperative rebalancing to minimize pause during scale-out.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Check downstream bottleneck</strong><br>If adding consumers doesn't help: the bottleneck is downstream (DB writes, external API). Profile: how long does processing each record take? Batch downstream writes, parallelize API calls, or temporarily skip non-critical enrichment.</div></div>
+    <div class="step"><div class="step-num">7</div><div class="step-body"><strong>Post-incident: Prevent recurrence</strong><br>Set consumer lag alerts earlier (warn at 100K, critical at 500K). Add auto-scaling (KEDA, HPA). Review <code>max.poll.records</code> and processing SLA. Add circuit breaker for downstream failures.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 2: Broker Disk Full -->
+<div class="section" id="disk-full">
+  <div class="section-header"><span class="section-icon">💾</span><span class="section-title">Scenario: Broker Disk Full — Producers Getting LEADER_NOT_AVAILABLE</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Alert:</strong> "kafka_broker_disk_usage_percent &gt; 90" on broker-2<br><strong>Symptom:</strong> Producers on partitions led by broker-2 get LEADER_NOT_AVAILABLE or timeout errors.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Confirm and quantify</strong><br><code>df -h /var/kafka-data</code> on broker-2. How much space is left? Minutes or hours? This determines urgency.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Immediate relief: delete old log segments</strong><br>Kafka retains segments per <code>log.retention.ms</code>. Force retention cleanup:<br><code>kafka-configs.sh --alter --topic non-critical-topic --add-config retention.bytes=10737418240</code><br>Wait for log cleaner to run (usually within minutes). Also: <code>kafka-log-dirs.sh</code> to see which topics consume most disk.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Identify the culprit topic</strong><br><code>du -sh /var/kafka-data/*/</code> sorted by size. Usually one or two topics dominate. Verify their retention config is appropriate. A topic with <code>retention.ms=-1</code> (infinite) is a common mistake.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Throttle producers (stop the bleeding)</strong><br><code>kafka-configs.sh --alter --entity-type clients --entity-name bulk-producer --add-config producer_byte_rate=1048576</code><br>This prevents more data from arriving while you free space.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Move partitions off the full broker</strong><br>Use partition reassignment to move some partitions from broker-2 to brokers with free space. Run with throttle to avoid making disk worse during reassignment.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Long-term: capacity planning</strong><br>Alert at 70%, not 90%. Enable tiered storage (Kafka 3.6+) to offload old segments to S3/GCS. Set <code>log.retention.bytes</code> per broker to cap total usage. Set up disk usage trending dashboards.</div></div>
+  </div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚨</span>
+    <div class="callout-body"><strong>Critical:</strong> If a broker's disk hits 100%, the broker process may crash — it needs disk to write ISR checkpoint files and offsets. A crashed broker triggers partition leader re-elections and ISR shrinkage. Alert and act at 80% to prevent this cascade.</div>
+  </div>
+</div>
+
+<!-- Scenario 3: Leader Election Storm -->
+<div class="section" id="leader-storm">
+  <div class="section-header"><span class="section-icon">⚡</span><span class="section-title">Scenario: Leader Election Storm — Cluster Instability After Upgrade</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Symptoms:</strong> Hundreds of leader elections per minute. Producers and consumers getting frequent "Not leader for partition" errors. Cluster JMX shows <code>ActiveControllerCount=0</code> intermittently.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Check controller stability</strong><br>JMX: <code>ActiveControllerCount</code> should always be exactly 1. If it's 0 or fluctuating, the controller is unstable. Check controller broker logs for exceptions.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Check ZooKeeper session (ZK mode)</strong><br>Controller stability requires a healthy ZK session. Check ZK logs for "session expired" events. Check controller broker GC — long GC pauses (&gt; <code>zookeeper.session.timeout.ms</code> = 18s default) cause ZK session expiry → controller re-election. <strong>After upgrade:</strong> JVM version change may affect GC behavior.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Check for version incompatibility</strong><br>After rolling upgrade: are all brokers on the same inter-broker protocol version? Check <code>inter.broker.protocol.version</code> config. Mismatched protocol versions can cause partition leadership instability.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Stabilize: reduce leader elections</strong><br>Temporarily set <code>auto.leader.rebalance.enable=false</code> to stop auto-election. Focus on getting all brokers stable first, then re-enable and run preferred replica election once.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Check network between brokers</strong><br>Network packet loss between brokers can cause heartbeat failures → ISR shrinkage → leader elections. <code>iperf3</code> between broker nodes. Check cloud provider network events.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Rollback if needed</strong><br>If upgrade caused the instability: roll back the last-upgraded broker to the previous version. Identify whether the issue is the new version or the upgrade process itself.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 4: ISR Shrinkage -->
+<div class="section" id="isr-shrink">
+  <div class="section-header"><span class="section-icon">🔁</span><span class="section-title">Scenario: ISR Shrinkage — Producers Blocked on acks=all</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Symptoms:</strong> Producer latency p99 jumps from 20ms to 5s. Alert: "UnderReplicatedPartitions &gt; 0". Consumer lag starts growing.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Identify affected partitions and lagging broker</strong><br><code>kafka-topics.sh --describe --under-replicated-partitions</code><br>Find which broker's replicas are out of sync.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Check the lagging broker</strong><br>Is it running? <code>ps aux | grep kafka</code>. Network reachable? Disk full? GC pauses? Broker logs: any errors?</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Check replica fetch lag metric</strong><br>JMX on the lagging broker: <code>kafka.server:type=FetcherLagMetrics,name=ConsumerLag,clientId=ReplicaFetcherThread-*</code>. High lag = follower can't keep up with leader's write rate.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>If broker is alive but lagging: check causes</strong><br>
+    - Disk I/O saturated on that broker: <code>iostat -x 1</code><br>
+    - Network between leader and follower: <code>iperf3</code><br>
+    - Follower fetch throttled: check <code>replica.fetch.max.bytes</code><br>
+    - Long GC pauses on follower: GC log analysis</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>If broker is down: trigger leader election</strong><br>Kafka auto-elects a new leader from ISR when a broker fails. Monitor <code>UnderReplicatedPartitions</code> — it should clear once the new leader is elected. If ISR = {leader only} and <code>min.insync.replicas=2</code>, producers get <code>NotEnoughReplicasException</code>. You may need to temporarily lower <code>min.insync.replicas</code> to unblock critical producers — with explicit awareness of the data risk.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>After broker recovery: wait for ISR rebuild</strong><br>When the broker restarts, it fetches missing segments from leaders. Monitor URP count — it should trend toward 0. Do NOT restart another broker until URP = 0.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 5: Data Loss Investigation -->
+<div class="section" id="data-loss">
+  <div class="section-header"><span class="section-icon">🔍</span><span class="section-title">Scenario: Data Loss Investigation — Missing Records</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Report:</strong> "We sent 10,000 payment records but only 9,847 were processed by downstream. 153 records appear to be missing."</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Determine where data is missing: producer or consumer side</strong><br>Check if records are IN Kafka first. Use <code>kafka-console-consumer.sh --from-beginning</code> on the topic and compare total record count vs expected. If records are in Kafka → consumer dropped them. If not → producer didn't send or broker dropped them.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Check producer configuration</strong><br>Was <code>acks=0</code> or <code>acks=1</code> used? These can result in data loss on broker failure. Check producer error metrics — were there send failures that weren't retried?</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Check for unclean leader election</strong><br>Was <code>unclean.leader.election.enable=true</code>? If a broker failed and a stale replica became leader, data written to the old leader but not replicated is lost. Check broker logs around the time of loss for "Unclean leader election".</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Check consumer offset commit behavior</strong><br>If consumer auto-committed offsets BEFORE processing: crash during processing skips those records. Check <code>enable.auto.commit</code> and <code>auto.commit.interval.ms</code>. Records may be in Kafka but consumer moved past them.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Check for topic retention</strong><br>If records are older than <code>log.retention.ms</code>, they've been deleted. Check when the records were sent vs current retention policy.</div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body"><strong>Recovery options</strong><br>If records are still in Kafka (consumer missed them): reset consumer group offset to replay. If records are gone from Kafka (broker loss, retention): replay from the upstream source system. If using exactly-once semantics: check transaction log for aborted transactions.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 6: Producer Backpressure -->
+<div class="section" id="producer-fail">
+  <div class="section-header"><span class="section-icon">🔒</span><span class="section-title">Scenario: Producer Backpressure — Application Thread Blocked</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Symptom:</strong> Application threads are blocked for 30+ seconds. Heap dumps show threads stuck in <code>KafkaProducer.send()</code>. No TimeoutException — just blocking.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Diagnose: RecordAccumulator buffer full</strong><br>JMX: <code>kafka.producer:type=producer-metrics,name=bufferpool-wait-ratio</code> &gt; 0 means producer is blocked waiting for buffer space. Root cause: Sender thread can't drain batches to broker fast enough.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Why is Sender not draining?</strong><br>
+    - Broker is slow: check RequestQueueSize, LocalTimeMs<br>
+    - ISR issue: acks=all waiting for lagging followers<br>
+    - Too many in-flight requests: <code>max.in.flight.requests.per.connection</code> exceeded<br>
+    - Network saturation between producer and broker</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Immediate fix: increase buffer or reduce max.block.ms</strong><br>Increase <code>buffer.memory</code> to give Sender more breathing room. Or reduce <code>max.block.ms</code> so <code>send()</code> throws an exception faster (fail-fast) rather than blocking indefinitely — letting the application handle the backpressure explicitly.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Fix the root cause</strong><br>If broker is slow: fix broker (disk, IO threads, ISR). If producer is sending too fast: implement rate limiting in the application (token bucket, semaphore). Kafka is not a buffer for unbounded production rate.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Design consideration: async vs sync send</strong><br>Use async <code>send(record, callback)</code> instead of <code>send(record).get()</code>. The callback fires when the record is acknowledged. Application doesn't block the calling thread. Handle errors in the callback. This makes backpressure visible as a callback error rather than a thread block.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 7: Network Partition -->
+<div class="section" id="network-part">
+  <div class="section-header"><span class="section-icon">🌐</span><span class="section-title">Scenario: Network Partition Between Kafka DCs</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Scenario:</strong> Your Kafka cluster spans 2 availability zones. The network link between AZ-A and AZ-B is severed. What happens?</div>
+  </div>
+
+  <p style="color:var(--muted);font-size:13px;margin-bottom:16px;"><strong>Depends on your ISR configuration:</strong></p>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>If RF=3, ISR replicas spread across AZs</h4>
+      <p>With 2 brokers in AZ-A and 1 in AZ-B: AZ-A partition is the leader. AZ-B broker loses connectivity → removed from ISR after <code>replica.lag.time.max.ms</code>. With <code>min.insync.replicas=2</code>: AZ-A still has 2 ISRs → cluster continues producing normally. AZ-B broker is URP but not blocking.</p>
+    </div>
+    <div class="concept-card">
+      <h4>If ISR = {AZ-A leader, AZ-B follower} only (ISR=2, min.insync=2)</h4>
+      <p>Network split → AZ-B follower can't ack → removed from ISR → ISR becomes {leader only} → min.insync.replicas=2 not met → producers get NotEnoughReplicasException → writes blocked. This is the designed behavior: protect data integrity over availability.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Split-brain risk with unclean election</h4>
+      <p>If <code>unclean.leader.election.enable=true</code>: AZ-B broker may elect itself as leader for partitions it had (out of sync). When network heals: two leaders for same partition → data divergence. This is why unclean election must be false in financial systems.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Consumer behavior during partition</h4>
+      <p>Consumers in AZ-B lose connectivity to AZ-A leaders → session timeout → rebalance → consumers in AZ-A take over those partitions. This causes temporary lag spike but recovers when rebalance completes.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Scenario 8: Controller Failover -->
+<div class="section" id="controller-fail">
+  <div class="section-header"><span class="section-icon">🏛️</span><span class="section-title">Scenario: Controller Failover — Broker Hosting Controller Crashes</span></div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>What happens automatically (ZK mode)</strong><br>ZK session for the controller expires (typically 6–18s). Remaining brokers race to write the <code>/controller</code> znode. First to succeed becomes new controller. New controller reads ALL partition state from ZK (can take seconds to minutes for large clusters).</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>What happens automatically (KRaft mode)</strong><br>Raft election among controller quorum. Takes milliseconds. New controller already has complete metadata in its Raft log. No ZK round-trip. Brokers continue with cached metadata during brief election window.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>During controller election: admin operations are blocked</strong><br>Topic creation, partition reassignment, ACL changes all require the active controller. These are queued and resume after election. Data path (produce/consume) is NOT blocked — brokers serve data independently of the controller.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>After new controller elected</strong><br>New controller runs leader recovery for any partitions whose leader was the crashed broker. Elects new partition leaders from ISR. These leader elections cause a brief "not leader" period for those partitions — producers retry automatically.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Verify recovery</strong><br><code>kafka-broker-api-versions.sh</code> — returns controller broker ID. JMX <code>ActiveControllerCount</code> = 1. <code>UnderReplicatedPartitions</code> trending to 0. Run preferred replica election to restore optimal partition placement.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 9: Rebalance Loop -->
+<div class="section" id="rebalance-loop">
+  <div class="section-header"><span class="section-icon">🔄</span><span class="section-title">Scenario: Rebalance Loop — Consumers Perpetually Rebalancing</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Symptom:</strong> Consumer logs show "Rebalance in progress" every 30–60 seconds. Consumer lag growing. Consumer group never reaches stable state.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Identify the unstable consumer</strong><br>Consumer logs on each instance: which one is repeatedly joining/leaving? Look for: "Attempting to send heartbeat to group coordinator" followed by "Member heartbeat timeout".</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Common cause: poll loop too slow</strong><br>Consumer calls <code>poll()</code>, processes 500 records, takes 6 minutes → exceeds <code>max.poll.interval.ms</code> (default 5min) → kicked out → rebalance → reassignment → repeat.<br><strong>Fix:</strong> Reduce <code>max.poll.records</code> so each batch is processed within the interval. Or increase <code>max.poll.interval.ms</code> if processing is legitimately slow.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Common cause: GC pause exceeds session timeout</strong><br>Long stop-the-world GC on consumer → can't send heartbeat → kicked out. Fix: switch to G1GC/ZGC. Increase <code>session.timeout.ms</code> (but don't exceed <code>group.max.session.timeout.ms</code> on broker, default 30min).</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Common cause: network issues</strong><br>Heartbeat packets dropped between consumer and group coordinator. Check network stability. Consumer restart doesn't help — underlying network issue persists.</div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body"><strong>Use Cooperative Rebalancing as mitigation</strong><br>Switch to <code>partition.assignment.strategy=CooperativeStickyAssignor</code>. This minimizes disruption: only partitions that change ownership are revoked. Consumers keep their other partitions during rebalance — lag impact greatly reduced even with frequent rebalances.</div></div>
+  </div>
+</div>
+
+<!-- Scenario 10: Consumers at Lag Zero but Data Not Processed -->
+<div class="section" id="lag-zero">
+  <div class="section-header"><span class="section-icon">❓</span><span class="section-title">Scenario: Consumer Lag Shows Zero but Records Not Being Processed</span></div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body"><strong>Symptom:</strong> <code>kafka-consumer-groups.sh</code> shows lag = 0 for the group but the downstream database shows missing records.</div>
+  </div>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body"><strong>Most likely cause: auto-commit committed before processing</strong><br>With <code>enable.auto.commit=true</code> and <code>auto.commit.interval.ms=5000</code>: the consumer commits the offset every 5 seconds regardless of whether processing succeeded. If the consumer fetched records and committed the offset but then crashed during processing → those records appear "consumed" (lag=0) but were never processed.</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body"><strong>Check consumer for silent errors</strong><br>Look for swallowed exceptions in the consumer's processing code. A <code>try { process() } catch (Exception e) { /* ignored */ }</code> will advance the offset without actually processing the record.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body"><strong>Check offset commit mode</strong><br>Switch to manual commit: <code>enable.auto.commit=false</code>. Commit only after confirmed write to DB. This ensures lag=0 actually means "processed," not "fetched."</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body"><strong>Recovery</strong><br>Reset consumer group offset to replay the missing records: <code>kafka-consumer-groups.sh --reset-offsets --to-datetime &lt;time-before-incident&gt; --execute</code>. Ensure sink is idempotent (upsert by primary key) to handle duplicates from replay.</div></div>
+  </div>
+</div>
+
+
+<!-- ════════════════════════════════════════════════════════
+     SCENARIO 11 — HIGH CONSUMER LAG CAUSED BY BROKER DOWN + URP CASCADE
+     ════════════════════════════════════════════════════════ -->
+<div class="section" id="lag-broker-down">
+  <div class="section-header"><span class="section-icon">🔗</span>
+    <span class="section-title">Scenario: Consumer Lag from Broker Failure → URP Cascade</span>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body">
+      <strong>Alerts firing simultaneously:</strong><br>
+      1. <code>UnderReplicatedPartitions &gt; 0</code> — broker-3 shows 120 URPs<br>
+      2. <code>consumer_group_lag{group=orders-processor} &gt; 200000</code><br>
+      3. Producers reporting <code>NotEnoughReplicasException</code> intermittently<br>
+      <strong>Impact:</strong> Order confirmation emails delayed 20 min. SLA breach imminent.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">🧠</span>
+    <div class="callout-body">
+      <strong>Why these three alerts fire together — the causal chain:</strong><br>
+      Broker-3 crashes → partitions it <em>leads</em> have no leader → producers get LEADER_NOT_AVAILABLE → writes fail/retry → throughput drops → consumer lag stops growing (no new data) but then ALSO: partitions where broker-3 was a <em>follower</em> are evicted from ISR → ISR shrinks to RF−1 → if ISR count drops below <code>min.insync.replicas</code> → producers get NotEnoughReplicasException → writes queue up in RecordAccumulator → consumer lag balloons as backlogged records flush in after broker recovers.
+    </div>
+  </div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Step 1 — Separate the lag signal from the broker signal</h4>
+  <div class="diagram"><pre>
+# How many partitions are under-replicated, and which broker is missing?
+kafka-topics.sh --bootstrap-server :9092 \
+  --describe --under-replicated-partitions
+# Output shows: Replicas: 1,2,3   Isr: 1,2   ← broker-3 evicted from ISR
+# Count of URPs: 120 partitions → all on broker-3
+
+# Is broker-3 actually down?
+kafka-broker-api-versions.sh --bootstrap-server broker-3:9092
+# If connection refused → broker is down
+
+# Confirm via JMX (from any running broker):
+# kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions
+  </pre></div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Step 2 — Understand which consumer lag is real vs artefact</h4>
+  <div class="diagram"><pre>
+kafka-consumer-groups.sh --bootstrap-server :9092 \
+  --describe --group orders-processor
+
+# For partitions where broker-3 WAS the leader:
+#   CONSUMER-ID = none (no leader = no fetch possible)
+#   LAG = (LOG-END-OFFSET - CURRENT-OFFSET) appears frozen
+#   → Lag is NOT growing (no new writes landing), but also not draining
+
+# For other partitions (broker-3 was follower, other broker is leader):
+#   Those partitions CAN still receive writes, so lag may grow
+#   if consumers can't reconnect to the new partition assignments
+  </pre></div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Parameter Deep-Dive: What controls ISR eviction?</h4>
+    <table class="kv-table">
+      <thead><tr><th>Parameter</th><th>What it does</th><th>Default</th><th>Tuning note</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>replica.lag.time.max.ms</code></td>
+          <td>A follower that has not sent a fetch request to the leader within this window is evicted from ISR. This is the primary ISR-eviction trigger — it fires even if the follower is alive but slow (GC, disk saturation).</td>
+          <td>30 000 ms</td>
+          <td>Reduce to 10–15s to detect failures faster; risk: transient GC pauses cause false evictions. Increase if GC pauses are long.</td>
+        </tr>
+        <tr>
+          <td><code>min.insync.replicas</code></td>
+          <td>When <code>acks=all</code>, the leader will only acknowledge a write after this many replicas (including itself) are in the ISR. If ISR shrinks below this value, the producer gets <code>NotEnoughReplicasException</code> and must retry.</td>
+          <td>1</td>
+          <td>Production: always set to RF−1 (e.g., min.ISR=2 for RF=3). Set it per topic, not just cluster default.</td>
+        </tr>
+        <tr>
+          <td><code>unclean.leader.election.enable</code></td>
+          <td>If true, a replica NOT in the ISR can be elected leader when the ISR is empty. Restores availability at the cost of data loss (the lagging replica becomes authoritative). If false, the partition stays OFFLINE until an ISR member recovers.</td>
+          <td>false</td>
+          <td>Always <code>false</code> for financial data. <code>true</code> only for analytics/logging topics where losing a few records is acceptable.</td>
+        </tr>
+        <tr>
+          <td><code>num.replica.fetchers</code></td>
+          <td>Number of threads per broker that pull data from partition leaders on other brokers. More threads = faster replication catch-up after a broker returns, but higher CPU and network cost.</td>
+          <td>1</td>
+          <td>Set to 4–8 for high-throughput clusters. Increase if ISR recovery is slow after broker restart.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Step 3 — Triage: is broker-3 recoverable quickly?</h4>
+  <div class="diagram"><pre>
+# Check broker-3 host — is process dead or hung?
+systemctl status kafka   # on broker-3 host
+journalctl -u kafka -n 100 --no-pager  # last 100 log lines
+
+# Scenarios:
+# A) OOM / crash → restart: systemctl start kafka
+#    Then monitor URP recovery: watch -n5 kafka-topics.sh --under-replicated-partitions
+#    URPs should trend to 0 as broker-3 re-fetches missing data
+
+# B) Disk full → free space first (see disk-full runbook), then restart
+
+# C) Hardware failure → reassign broker-3 partitions to surviving brokers:
+kafka-reassign-partitions.sh --bootstrap-server :9092 \
+  --reassignment-json-file reassignment.json --execute \
+  --throttle 50000000   # 50 MB/s: prevents starving producers during catchup
+  </pre></div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Step 4 — Address consumer lag during recovery</h4>
+  <div class="diagram"><pre>
+# While broker-3 recovers, consumers assigned to its partitions are in limbo.
+# The group coordinator will trigger a rebalance and reassign those partitions
+# to other consumers — but consumers need to reconnect.
+
+# Force consumer group refresh (if consumers are stuck):
+# Most modern clients auto-reconnect. If not:
+kafka-consumer-groups.sh --bootstrap-server :9092 \
+  --group orders-processor --reset-offsets \
+  --to-latest --topic orders --execute
+# Only if you are OK skipping the backlog (e.g., real-time only system)
+
+# If you need to process ALL records: wait for broker-3 to recover
+# and let consumers drain normally. Do NOT reset offsets.
+
+# Scale up consumers to drain backlog faster:
+# Add consumers (up to partition count). They pick up partitions from broker-3
+# once its leaders are re-elected on surviving brokers.
+  </pre></div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Step 5 — Apply replication throttle during ISR rebuild</h4>
+  <div class="diagram"><pre>
+# Without throttle, broker-3 catching up will saturate its network/disk
+# and ALSO impact producer latency on the same broker.
+# Apply throttle before restarting broker-3:
+
+kafka-configs.sh --bootstrap-server :9092 \
+  --entity-type brokers --entity-name 3 --alter \
+  --add-config 'leader.replication.throttled.rate=104857600,
+                follower.replication.throttled.rate=104857600'
+# 100 MB/s limit → recovery in ~hours instead of minutes, but producers unaffected
+
+# Remove throttle after URP = 0:
+kafka-configs.sh --bootstrap-server :9092 \
+  --entity-type brokers --entity-name 3 --alter \
+  --delete-config 'leader.replication.throttled.rate,follower.replication.throttled.rate'
+  </pre></div>
+
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Interview answer structure:</strong> "When I see consumer lag + URP firing together, my first question is: did a broker go down? Because that's the most common root cause of both alerts simultaneously. I check URP first — it tells me which broker — then I look at consumer lag by partition to see if the lag is on the partitions that broker led. If yes, fixing the broker fixes the lag. If the lag is on unrelated partitions, there's a second independent problem."</div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SCENARIO 12 — HIGH CPU ON BROKERS
+     ════════════════════════════════════════════════════════ -->
+<div class="section" id="high-cpu">
+  <div class="section-header"><span class="section-icon">🔥</span>
+    <span class="section-title">Scenario: High CPU on Kafka Brokers — Three Root Causes</span>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body">
+      <strong>Alert:</strong> <code>broker_cpu_usage &gt; 85% for 10m</code> on 3 of 6 brokers<br>
+      <strong>Symptoms:</strong> Produce latency P99 climbing from 50ms → 800ms. Consumers reporting slow fetch. No disk or network alerts.
+    </div>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">🧠</span>
+    <div class="callout-body"><strong>Kafka is not CPU-intensive by design</strong> — it uses zero-copy (sendfile) and relies on OS page cache. High broker CPU almost always means one of: (1) compression mismatch forcing broker-side recompression, (2) too many small requests from unbatched producers, (3) a hot partition overloading one broker, or (4) JVM GC pressure. Each has a different fingerprint.</div>
+  </div>
+
+  <h3 style="color:var(--yellow);margin:24px 0 12px">Root Cause A — Compression Mismatch (Broker Recompression)</h3>
+
+  <div class="diagram"><pre>
+How to detect:
+  # CPU profile (async-profiler or JFR on the broker JVM):
+  java -jar async-profiler.jar -d 30 -f profile.html $(jps | grep Kafka | awk '{print $1}')
+  # Look for: sun.security.provider.SHA, org.xerial.snappy, net.jpountz.lz4
+  # If compression codec methods are in top 5 hotspots → broker is recompressing
+
+  # Alternatively via thread dump — look for IO threads spending time in compress/decompress
+
+Root cause explanation:
+  Producer sends: compression.type=snappy
+  Broker config:  compression.type=lz4   ← MISMATCH
+
+  Kafka broker must:
+    1. Decompress the Snappy batch (CPU)
+    2. Re-validate message structure
+    3. Re-compress using lz4 (CPU)
+  This happens FOR EVERY PRODUCE REQUEST on the broker's IO thread.
+
+  Also occurs when:
+    - Producer uses compression.type=none → broker has compression.type=lz4
+      Broker must compress every uncompressed batch.
+    - Large messages (20KB+) amplify the CPU cost per batch.
+
+Fix:
+  Option A (preferred): Set producer compression.type to match broker config.
+    producer: compression.type=lz4
+    broker:   compression.type=lz4 (or compression.type=producer to accept any)
+
+  Option B: Set broker compression.type=producer (accept whatever producer sends, no recompression)
+    server.properties: compression.type=producer
+    ↑ Zero broker CPU for compression. But consumers see heterogeneous compression.
+  </pre></div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Parameter: <code>compression.type</code></h4>
+    <table class="kv-table">
+      <thead><tr><th>Scope</th><th>Value</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>Producer</td><td><code>none</code> (default)</td><td>Send uncompressed batches. Highest network cost, zero CPU cost.</td></tr>
+        <tr><td>Producer</td><td><code>lz4</code></td><td>Fast compression. Best throughput/CPU tradeoff. Recommended.</td></tr>
+        <tr><td>Producer</td><td><code>zstd</code></td><td>Best compression ratio. Slightly higher CPU. Good for large messages.</td></tr>
+        <tr><td>Producer</td><td><code>snappy</code></td><td>Legacy. Use lz4 instead.</td></tr>
+        <tr><td>Broker (topic)</td><td><code>producer</code></td><td>Accept whatever the producer sends. No recompression. Consumers see producer's codec.</td></tr>
+        <tr><td>Broker (topic)</td><td><code>lz4</code></td><td>Force all data stored in lz4. Broker recompresses if producer used a different codec — CPU cost.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="color:var(--yellow);margin:24px 0 12px">Root Cause B — Ineffective Batching (Too Many Small Requests)</h3>
+
+  <div class="diagram"><pre>
+How to detect:
+  # On broker: monitor requests per second vs throughput (MB/s)
+  # If: requests/s is HIGH but MB/s per request is LOW → unbatched producers
+
+  # JMX metric: kafka.network:type=RequestMetrics,name=RequestsPerSec,request=Produce
+  # Healthy: 1,000–5,000 req/s handling 200+ MB/s  → large batches
+  # Unhealthy: 50,000 req/s handling 200 MB/s      → tiny batches = high overhead
+
+  # Also check: RequestQueueSize climbing (broker IO threads overwhelmed)
+
+Root cause:
+  Producer config: linger.ms=0 (default), batch.size=16384 (16KB default)
+
+  linger.ms=0 means: send immediately, don't wait for more records.
+  Result: if records arrive at 10,000 msg/sec, producer sends 10,000 separate
+  requests/sec (each with 1 record) instead of batching into 100 requests
+  of 100 records each.
+
+  Broker cost: Each request requires:
+    - Network thread to read request header + body
+    - IO thread to write to log
+    - Network thread to send response
+    → 3× thread operations per request, vs batched = 3× operations for N records
+
+  High request rate → num.network.threads saturated → RequestHandlerAvgIdlePercent drops
+  → broker appears CPU-bound but the real cause is thread context-switching overhead.
+
+Fix:
+  Producer side (always fix here first — zero broker changes needed):
+    linger.ms = 20        ← wait up to 20ms for more records to accumulate
+                             20ms is imperceptible to humans, 10x-50x fewer requests
+    batch.size = 65536    ← 64KB batch (vs 16KB default) — larger batches = fewer requests
+    buffer.memory = 67108864  ← 64MB — enough buffer so linger.ms can accumulate
+
+  Verify fix: check kafka.producer:type=producer-metrics,name=batch-size-avg
+  Should increase significantly after tuning.
+  </pre></div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Parameters: Batching Triangle</h4>
+    <table class="kv-table">
+      <thead><tr><th>Parameter</th><th>What it does</th><th>Default</th><th>Tuning</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>batch.size</code></td>
+          <td>Maximum bytes accumulated per partition before the Sender thread flushes a batch to the broker. Does NOT mean the producer waits until full — it sends sooner if <code>linger.ms</code> expires. Acts as an upper bound on batch size.</td>
+          <td>16 384 (16 KB)</td>
+          <td>Increase to 65536–524288 (64KB–512KB) for high-throughput. Larger batches = fewer requests + better compression ratio.</td>
+        </tr>
+        <tr>
+          <td><code>linger.ms</code></td>
+          <td>How long the Sender thread waits for more records to arrive before sending an incomplete batch. <code>linger.ms=0</code> sends immediately. Adding even 5–20ms dramatically increases batch fill rate without noticeable latency impact.</td>
+          <td>0</td>
+          <td>Set to 5–100ms depending on latency tolerance. 20ms is the sweet spot for most financial pipelines.</td>
+        </tr>
+        <tr>
+          <td><code>buffer.memory</code></td>
+          <td>Total memory the producer uses to buffer records waiting to be sent. When this buffer is full, <code>send()</code> blocks for up to <code>max.block.ms</code>. Must be large enough to absorb producer bursts during broker slowdowns.</td>
+          <td>33 554 432 (32 MB)</td>
+          <td>Increase to 64–256 MB for high-throughput producers. Monitor <code>bufferpool-wait-ratio</code> metric — if &gt;0, buffer is too small.</td>
+        </tr>
+        <tr>
+          <td><code>max.in.flight.requests.per.connection</code></td>
+          <td>Number of unacknowledged requests the producer can have in-flight to a single broker at once. Higher = more pipelining = more throughput. Must be ≤5 when <code>enable.idempotence=true</code> (Kafka's dedup works only up to 5 in-flight).</td>
+          <td>5</td>
+          <td>Keep at 5 with idempotence. For fire-and-forget (acks=0) can increase, but rarely needed.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="color:var(--yellow);margin:24px 0 12px">Root Cause C — Hot Broker (Partition Imbalance)</h3>
+
+  <div class="diagram"><pre>
+How to detect:
+  # Which brokers are hot? (CPU per broker, not cluster average)
+  # If 2 of 6 brokers are at 90% CPU and 4 are at 10% → imbalance
+
+  # Check leader distribution:
+  kafka-topics.sh --bootstrap-server :9092 --describe | \
+    grep "^Topic:" | \
+    awk '{print $4}' | sort | uniq -c | sort -rn
+  # $4 = Leader broker ID. High count = too many leaders on one broker.
+
+  # Or use kafka-leader-election.sh to see imbalance:
+  kafka-leader-election.sh --bootstrap-server :9092 \
+    --election-type PREFERRED --all-topic-partitions
+
+Root cause - scenario A: Leader imbalance after rolling restart
+  After a broker restarts, its preferred replicas (the ones it was originally
+  assigned as leader) stay with other brokers. auto.leader.rebalance.enable=true
+  should fix this automatically, but rebalance is delayed by
+  leader.imbalance.check.interval.seconds (default 300s = 5 min).
+  During this window, restarted broker has 0 leaders but still handles
+  replication traffic → other brokers have 2× leaders → hot.
+
+  Fix: Trigger immediate rebalance:
+    kafka-leader-election.sh --bootstrap-server :9092 \
+      --election-type PREFERRED --all-topic-partitions
+
+Root cause - scenario B: Hot partition (bad key design)
+  One partition receives 80% of traffic because the partition key has
+  low cardinality (e.g., all messages keyed by country="India").
+  The broker leading that partition is saturated regardless of leader balance.
+
+  Detect: Check bytes-in-rate per partition (per topic):
+    kafka-log-dirs.sh --bootstrap-server :9092 --topic-list payments
+    # Look for one partition significantly larger than others
+
+  Fix (requires application change):
+    - Add a secondary key (e.g., country + customerId hash)
+    - Use round-robin partitioning (null key) if ordering is not needed
+    - Increase partition count → distributes the hot partition's traffic
+      to more leaders across more brokers
+  </pre></div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Parameters: Broker Threading — where CPU is actually spent</h4>
+    <table class="kv-table">
+      <thead><tr><th>Parameter</th><th>What it does</th><th>Default</th><th>When to increase</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>num.network.threads</code></td>
+          <td>Number of threads in the NetworkProcessor pool. Each thread handles a set of client connections: reads request bytes off the socket, places them in the RequestQueue, picks responses from the ResponseQueue, sends them back. Saturated = high socket read/write wait.</td>
+          <td>3</td>
+          <td>Increase to 5–8 when <code>NetworkProcessorAvgIdlePercent &lt; 30%</code>. Monitor with JMX.</td>
+        </tr>
+        <tr>
+          <td><code>num.io.threads</code></td>
+          <td>Number of IO (request handler) threads. These pick requests from the RequestQueue and do the actual work: write to log, read from log, interact with replication state. Saturated = high queue wait time on produce/fetch requests.</td>
+          <td>8</td>
+          <td>Increase to 12–24 for high-throughput brokers. Watch <code>RequestHandlerAvgIdlePercent</code> — below 30% means add threads.</td>
+        </tr>
+        <tr>
+          <td><code>auto.leader.rebalance.enable</code></td>
+          <td>Whether the controller automatically re-assigns leaders back to the preferred replica (the first replica in the assignment list) over time. Prevents leader imbalance after rolling restarts.</td>
+          <td>true</td>
+          <td>Keep true. Set <code>leader.imbalance.check.interval.seconds=60</code> (default 300) for faster rebalancing after restarts.</td>
+        </tr>
+        <tr>
+          <td><code>leader.imbalance.per.broker.percentage</code></td>
+          <td>Threshold percentage of leader imbalance per broker before the controller triggers a preferred leader election. Default 10% means: if a broker has 10% more leaders than its "fair share," rebalancing is triggered.</td>
+          <td>10</td>
+          <td>Lower to 5 for more aggressive balancing. Higher reduces rebalance frequency.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SCENARIO 13 — CONSUMER GROUP REBALANCE DEEP DIVE
+     ════════════════════════════════════════════════════════ -->
+<div class="section" id="rebalance-deep">
+  <div class="section-header"><span class="section-icon">🔄</span>
+    <span class="section-title">Scenario: Frequent Consumer Group Rebalance — Deep Parameter Dive</span>
+  </div>
+
+  <div class="callout warn">
+    <span class="callout-icon">📟</span>
+    <div class="callout-body">
+      <strong>Alert:</strong> <code>kafka_consumer_rebalance_rate &gt; 4 per hour</code><br>
+      <strong>Symptom:</strong> Consumer lag oscillates rhythmically — grows during rebalance, drains briefly, grows again. Applications log "Rebalance in progress" every 3–5 minutes. Downstream SLA being breached.
+    </div>
+  </div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>The Three Timing Parameters — Relationships and Constraints</h4>
+    <div class="diagram"><pre>
+Parameter: heartbeat.interval.ms
+  What it does: How often the consumer sends a heartbeat to the Group Coordinator
+                broker. The heartbeat is a lightweight keepalive — it carries NO data.
+                It only tells the broker "I am still alive and a member of this group."
+                The heartbeat runs on a SEPARATE background thread (since Kafka client
+                2.x), independent of the poll() thread. So even a slow processing
+                loop does NOT delay heartbeats — only a complete consumer JVM freeze does.
+  Default: 3 000 ms (3 seconds)
+  Constraint: Must be set to LESS than 1/3 of session.timeout.ms
+              (so at least 3 heartbeats fit within one session timeout)
+
+Parameter: session.timeout.ms
+  What it does: The maximum time the GROUP COORDINATOR (broker-side) will wait
+                without receiving a heartbeat before declaring a consumer DEAD.
+                When a consumer is declared dead, the coordinator triggers a GROUP
+                REBALANCE — all partitions are revoked from all consumers and
+                redistributed. This is a BROKER-SIDE timeout, not client-side.
+                The consumer does not control when it "times out" — only the broker does.
+  Default: 45 000 ms (Kafka 3.x, was 10 000 ms in earlier versions)
+  Range: [group.min.session.timeout.ms, group.max.session.timeout.ms]
+         Broker defaults: min=6 000 ms, max=1 800 000 ms (30 min)
+  Constraint: Must be at least 3× heartbeat.interval.ms
+
+Parameter: max.poll.interval.ms
+  What it does: The maximum time between two consecutive poll() calls. This is
+                a CLIENT-SIDE liveness check. If the consumer application does not
+                call poll() within this interval, the Kafka client library ITSELF
+                sends a LeaveGroup request to the broker, voluntarily removing
+                itself from the group and triggering a rebalance.
+                Unlike session.timeout.ms (which detects JVM/network death),
+                max.poll.interval.ms detects "alive but stuck processing" — i.e.,
+                the consumer thread is blocked processing records and can't call poll().
+  Default: 300 000 ms (5 minutes)
+  Key distinction: heartbeat thread keeps session alive even when poll() is blocked.
+                   But if poll() isn't called within max.poll.interval.ms, the CLIENT
+                   triggers self-eviction regardless of heartbeat success.
+    </pre></div>
+    <div class="diagram"><pre>
+The timeline of a rebalance triggered by max.poll.interval.ms breach:
+
+T=0:    consumer.poll() returns 500 records
+T=0:    application starts processing 500 records (heavy DB writes)
+T=30s:  heartbeat thread sends heartbeat → broker says "still alive"  ✓
+T=60s:  heartbeat thread sends heartbeat → broker says "still alive"  ✓
+T=5min: max.poll.interval.ms expires → Kafka CLIENT sends LeaveGroup to broker
+T=5min: Broker triggers rebalance → ALL consumers in group revoke partitions
+T=5min: Consumer finishes processing → calls poll() → gets RebalanceInProgressException
+T=5min: Consumer rejoins group → rebalance again → partitions reassigned
+T=7min: Stable again → consumer polls → gets same 500 records AGAIN (offset not committed)
+→ Duplicate processing of the 500 records
+    </pre></div>
+  </div>
+
+  <h4 style="color:var(--accent);margin:20px 0 10px">Diagnostic Checklist — Finding the Cause</h4>
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body">
+      <strong>Is the rebalance triggered by heartbeat timeout or poll timeout?</strong><br>
+      Consumer logs: search for these distinct messages:<br>
+      <code>"group coordinator ... Heart beat session timeout"</code> → session.timeout.ms breach (JVM hung, GC pause, network)<br>
+      <code>"exceeded max.poll.interval.ms"</code> → poll() not called in time (slow processing)
+    </div></div>
+
+    <div class="step"><div class="step-num">2</div><div class="step-body">
+      <strong>If session.timeout.ms breach — GC pause or network?</strong>
+      <div class="diagram"><pre>
+# GC pause: check broker-reported heartbeat gap vs GC log timing
+# On the consumer host:
+grep "pause" /var/log/kafka-consumer-gc.log | tail -20
+# Look for stop-the-world pauses > session.timeout.ms / 2
+
+# If GC pauses are the cause:
+# Fix 1: Switch to ZGC (-XX:+UseZGC) — sub-millisecond pauses
+# Fix 2: Increase session.timeout.ms (e.g., 60 000 ms)
+#         But increase heartbeat.interval.ms proportionally:
+#         session.timeout.ms=60000 → heartbeat.interval.ms=15000
+
+# If network is the cause (packet loss consumer → broker):
+# Run: ping -i 0.1 -c 1000 <group-coordinator-ip>
+# Check: are heartbeat intervals consistently arriving in broker logs?
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">3</div><div class="step-body">
+      <strong>If max.poll.interval.ms breach — processing too slow?</strong>
+      <div class="diagram"><pre>
+# Measure actual processing time per batch:
+long start = System.currentTimeMillis();
+ConsumerRecords records = consumer.poll(Duration.ofMillis(100));
+// process records...
+long elapsed = System.currentTimeMillis() - start;
+log.info("Batch processing took {}ms", elapsed);
+# If elapsed consistently > max.poll.interval.ms × 0.8 → too close to limit
+
+# Fix options:
+# Option A: Reduce max.poll.records so each batch is smaller:
+max.poll.records = 100  (was 500 default)
+# If each record takes 50ms → 100 records = 5s total → safe within 5min limit
+
+# Option B: Increase max.poll.interval.ms:
+max.poll.interval.ms = 600000  (10 min)
+# Risk: Kafka waits 10min before detecting a truly dead consumer.
+# Acceptable if processing is legitimately slow (e.g., ML inference per record).
+
+# Option C: Move processing off the poll thread (async processing):
+// Poll quickly, hand to thread pool, poll again immediately
+executor.submit(() -> process(records));
+consumer.commitAsync(); // commit after submission, not after completion
+// Risk: If worker thread crashes, offset is already committed → at-most-once
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">4</div><div class="step-body">
+      <strong>Is the consumer APPLICATION crashing and restarting?</strong>
+      <div class="diagram"><pre>
+# Check consumer pod restarts (K8s):
+kubectl get pods -n payments | grep consumer
+# RESTARTS column: should be 0 or very low
+
+# If consumer is crashing: check for deserialization errors, NullPointerException
+# in the processing logic on specific records.
+# A single malformed record can crash the consumer → restart → rejoin → rebalance
+# → same record fetched again (if offset not committed) → crash → loop
+
+# Fix: DLQ for bad records
+try {
+  process(record);
+} catch (DeserializationException e) {
+  produceToDLQ(record);  // Send to dead letter queue
+  // DO NOT let the exception propagate — it will crash the consumer
+}
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">5</div><div class="step-body">
+      <strong>Switch to Cooperative Rebalancing as immediate mitigation</strong>
+      <div class="diagram"><pre>
+# Eager rebalance (default with RangeAssignor):
+#   ALL consumers revoke ALL partitions → all stop processing
+#   → rebalance completes → ALL partitions reassigned
+#   → lag spike during the gap (can be minutes for large groups)
+
+# Cooperative Sticky Assignor (incremental rebalance):
+#   Only partitions that need to MOVE are revoked
+#   → consumers keep their unchanged partitions throughout
+#   → lag spike is minimal (only from the partitions being moved)
+
+# Set in consumer config:
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+# Also set on the broker (group.coordinator must allow it):
+# No broker config needed — the assignor runs on the client side.
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">6</div><div class="step-body">
+      <strong>Static membership — eliminate rebalances on rolling restarts</strong>
+      <div class="diagram"><pre>
+# Problem: Every consumer pod restart causes a rebalance (leave + rejoin)
+# With 10 consumers and rolling deploy → 10 rebalances during deploy
+
+# Solution: Static group membership
+# Each consumer gets a stable instance ID:
+group.instance.id=consumer-pod-0   # unique per consumer instance
+
+# Behaviour change:
+#   Normally: consumer leaves → immediate rebalance → rejoin → rebalance again
+#   Static:   consumer leaves → broker waits session.timeout.ms before removing
+#             If consumer rejoins WITHIN session.timeout.ms → NO rebalance
+#             It resumes with its previous partition assignments
+
+# Perfect for K8s rolling deploys where restart takes < session.timeout.ms:
+session.timeout.ms=60000  # 1 minute timeout
+# Pod restarts in ~30s → rejoins before timeout → zero rebalances during deploy
+      </pre></div>
+    </div></div>
+  </div>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Full Parameter Reference for Consumer Group Stability</h4>
+    <table class="kv-table">
+      <thead><tr><th>Parameter</th><th>What it does</th><th>Default</th><th>Recommended</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>session.timeout.ms</code></td>
+          <td>Broker-side timeout. Max time without a heartbeat before the consumer is declared dead and a rebalance triggered. A consumer missing heartbeats due to GC pause or network blip will be evicted if the pause exceeds this value.</td>
+          <td>45 000</td>
+          <td>45 000–60 000. Increase if GC pauses are frequent. Never exceed group.max.session.timeout.ms (broker setting).</td>
+        </tr>
+        <tr>
+          <td><code>heartbeat.interval.ms</code></td>
+          <td>How often the heartbeat background thread sends a heartbeat to the group coordinator. Must be &lt; 1/3 of session.timeout.ms so the broker can detect 3 missed heartbeats before timeout.</td>
+          <td>3 000</td>
+          <td>session.timeout.ms / 3. E.g., 15 000 if session.timeout.ms=45 000.</td>
+        </tr>
+        <tr>
+          <td><code>max.poll.interval.ms</code></td>
+          <td>Client-side liveness check on the poll() loop. If poll() is not called within this interval, the client sends LeaveGroup voluntarily. Detects "alive but stuck processing" — a different failure mode from session.timeout.ms.</td>
+          <td>300 000</td>
+          <td>Set to 2× the worst-case processing time for a full max.poll.records batch. Measure P99 processing time first.</td>
+        </tr>
+        <tr>
+          <td><code>max.poll.records</code></td>
+          <td>Maximum number of records returned by a single poll() call. Reducing this reduces the work per poll iteration, making it easier to stay within max.poll.interval.ms.</td>
+          <td>500</td>
+          <td>Tune based on: max.poll.records × avg_processing_time_per_record &lt; max.poll.interval.ms × 0.8</td>
+        </tr>
+        <tr>
+          <td><code>group.instance.id</code></td>
+          <td>Static membership ID. When set, the broker treats this consumer as a persistent group member. Restart within session.timeout.ms = no rebalance. Each consumer in the group must have a unique group.instance.id.</td>
+          <td>(not set)</td>
+          <td>Set for K8s deployments. Use pod name or a stable label: <code>consumer-0</code>, <code>consumer-1</code>, etc.</td>
+        </tr>
+        <tr>
+          <td><code>partition.assignment.strategy</code></td>
+          <td>Algorithm used to assign partitions to consumers during rebalance. Eager strategies (RangeAssignor, RoundRobinAssignor) revoke ALL partitions first. CooperativeStickyAssignor is incremental — only moves partitions that need changing.</td>
+          <td>RangeAssignor</td>
+          <td>CooperativeStickyAssignor for new deployments. StickyAssignor as intermediate step when migrating from Range.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     HERO SCENARIO — COMPLEX INCIDENT THAT STUMPED EVERYONE
+     ════════════════════════════════════════════════════════ -->
+<div class="section" id="hero">
+  <div class="section-header">
+    <span class="section-icon">🏆</span>
+    <span class="section-title">Hero Scenario: "The Silent Payment Loss — EOS Configured, Data Still Gone"</span>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Interview framing:</strong> "Tell me about a complex problem you solved that others couldn't." — Use STAR format: Situation → Task → Action → Result. The key is showing <em>how you thought</em>, not just what the answer was. Walk through your wrong hypotheses too — it shows systematic diagnosis.</div>
+  </div>
+
+  <div class="callout danger">
+    <span class="callout-icon">🔥</span>
+    <div class="callout-body">
+      <strong>Situation:</strong> Production payments pipeline at a financial institution. Exactly-once semantics (EOS) was fully configured and had been running for 6 months. A regulatory audit discovered that ~0.02% of payment records (roughly 1 in 5,000) were missing from the downstream settlement system. Audit trail showed the payments were authorised, but never appeared in settlement. No exceptions in any log. No DLQ entries. Consumer lag was consistently zero.
+    </div>
+  </div>
+
+  <h3 style="color:var(--accent);margin:24px 0 12px">The EOS Setup (for context)</h3>
+  <div class="diagram"><pre>
+Producer (payment-service):
+  enable.idempotence=true
+  acks=all
+  transactional.id=payment-producer-${instanceId}
+  transaction.timeout.ms=60000  ← 60 seconds to complete a transaction
+
+Broker:
+  min.insync.replicas=2
+  RF=3
+
+Consumer (settlement-service):
+  isolation.level=read_committed  ← ONLY reads committed transaction records
+  enable.auto.commit=false
+  Manual commit after DB write
+  </pre></div>
+
+  <h3 style="color:var(--yellow);margin:24px 0 12px">The Investigation — Three Wrong Hypotheses First</h3>
+
+  <div class="step-list">
+    <div class="step"><div class="step-num">❌</div><div class="step-body">
+      <strong>Hypothesis 1 (first team, week 1): Consumer is skipping records</strong><br>
+      The settlement consumer had idempotency logic — "if we've seen this payment ID, skip it." Suspected the dedup window was too wide.<br>
+      <strong>Disproved:</strong> Checked every missing payment ID — none appeared in the dedup store. The consumer had never seen these records at all. The consumer truly never fetched them.
+    </div></div>
+
+    <div class="step"><div class="step-num">❌</div><div class="step-body">
+      <strong>Hypothesis 2 (second team, week 2): Broker data loss — unclean election</strong><br>
+      A broker had failed 3 weeks ago. Suspected unclean leader election had caused data loss.<br>
+      <strong>Disproved:</strong> <code>unclean.leader.election.enable=false</code> was confirmed in broker config. Also, the missing records' timestamps were spread across 6 months — not clustered around the broker failure event. And the producer logs showed successful delivery callbacks for each missing record.
+    </div></div>
+
+    <div class="step"><div class="step-num">❌</div><div class="step-body">
+      <strong>Hypothesis 3 (third team, week 3): Consumer offset commit bug</strong><br>
+      Suspected offset committed before DB write — records fetched but not processed.<br>
+      <strong>Disproved:</strong> The settlement DB had no record of the payment IDs. But more conclusively: running <code>kafka-console-consumer --isolation-level read_committed --from-beginning</code> on the topic and counting records also showed these payment IDs were MISSING. The records were not in Kafka as committed data. This was broker-side, not consumer-side.
+    </div></div>
+  </div>
+
+  <h3 style="color:var(--green);margin:24px 0 12px">The Breakthrough — Read Uncommitted vs Read Committed</h3>
+
+  <div class="concept-card" style="margin:16px 0">
+    <div class="diagram"><pre>
+Key diagnostic step that changed everything:
+
+# Re-read the topic with isolation.level=read_UNCOMMITTED:
+kafka-console-consumer.sh --bootstrap-server :9092 \
+  --topic payments.transactions.v1 \
+  --from-beginning \
+  --isolation-level read_uncommitted \
+  --property print.offset=true
+
+# Result: The missing payment records ARE HERE — but with a special marker.
+# Kafka console showed them, but with a transaction control record
+# immediately following: type=ABORT
+
+# This means: the PRODUCER sent the records to Kafka, but the transaction
+# containing them was ABORTED. From the consumer's perspective
+# (isolation.level=read_committed), aborted records are invisible — correctly so.
+# But the PRODUCER believed it had successfully committed.
+
+# The records existed in Kafka as aborted transactions:
+# Offset 1001: payment-id-ABC  (part of transaction tx-42)
+# Offset 1002: ABORT_MARKER    (tx-42 aborted by broker)
+# Consumer with read_committed skips offset 1001 → payment lost
+    </pre></div>
+  </div>
+
+  <h3 style="color:var(--yellow);margin:24px 0 12px">Root Cause — transaction.timeout.ms and a Silent Exception</h3>
+
+  <div class="concept-card" style="margin:16px 0">
+    <h4>Parameter: <code>transaction.timeout.ms</code></h4>
+    <p style="color:var(--text-muted);font-size:13px;margin:8px 0">The maximum time a Kafka transaction can remain open (between beginTransaction() and commitTransaction() or abortTransaction()). If this timeout expires, the <strong>broker-side transaction coordinator automatically aborts the transaction</strong> — without the producer being immediately notified. The producer finds out only on its next produce() or commitTransaction() call, which returns a <code>ProducerFencedException</code>.</p>
+    <table class="kv-table">
+      <thead><tr><th>Setting</th><th>Default</th><th>Impact</th></tr></thead>
+      <tbody>
+        <tr><td><code>transaction.timeout.ms</code> (producer)</td><td>60 000 (60s)</td><td>If the transaction takes longer than 60s, the broker aborts it. Producer must detect and handle the resulting exception.</td></tr>
+        <tr><td><code>transaction.max.timeout.ms</code> (broker)</td><td>900 000 (15min)</td><td>Maximum value a producer is allowed to set for transaction.timeout.ms. Broker rejects producers with higher values.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="diagram"><pre>
+The actual code path that caused the loss (simplified):
+
+// PaymentProducer.java
+producer.beginTransaction();
+ProducerRecord record = new ProducerRecord("payments.transactions.v1", paymentId, data);
+producer.send(record).get();  // Record lands in Kafka (in open transaction)
+
+// ← 60 seconds pass here →
+// An external KYC validation API call was added in a recent release.
+// This API call happened INSIDE the transaction window.
+// The KYC API had P99 latency of 45s but P99.9 of 90s.
+// 1-in-5000 calls exceeded 60s → broker aborts the transaction server-side.
+
+kycService.validate(payment);  // occasionally takes 90+ seconds
+
+// By now, transaction.timeout.ms has expired on the broker.
+// The transaction was auto-aborted by the broker coordinator.
+
+try {
+    producer.commitTransaction();  // ← This call fails!
+} catch (ProducerFencedException | InvalidProducerEpochException e) {
+    // This was the CRITICAL BUG:
+    log.warn("Transaction commit failed, reinitialising producer", e);
+    producer.initTransactions();   // ← Resets producer state
+    // NO retry of the payment. NO alert. NO exception propagation.
+    // The payment silently dropped. The producer moved on to the next record.
+}
+
+// The warning log was there, but:
+// 1. Log level was WARN (not ERROR) — alerts were on ERROR only
+// 2. Log message said "reinitialising producer" — looked like a routine reset
+// 3. Rate: 1 in 5,000 → only ~20 WARNs per day in a sea of millions of log lines
+  </pre></div>
+
+  <h3 style="color:var(--green);margin:24px 0 12px">The Fix — Three Changes</h3>
+  <div class="step-list">
+    <div class="step"><div class="step-num">1</div><div class="step-body">
+      <strong>Move KYC call OUTSIDE the transaction window</strong>
+      <div class="diagram"><pre>
+// BEFORE (broken):
+producer.beginTransaction();
+producer.send(record).get();
+kycService.validate(payment);  // ← inside transaction, can exceed timeout
+producer.commitTransaction();
+
+// AFTER (fixed):
+ValidationResult kyc = kycService.validate(payment);  // ← outside transaction
+if (kyc.isApproved()) {
+    producer.beginTransaction();
+    producer.send(record).get();
+    producer.commitTransaction();   // ← transaction is now milliseconds long
+}
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">2</div><div class="step-body">
+      <strong>Never swallow ProducerFencedException silently</strong>
+      <div class="diagram"><pre>
+// ProducerFencedException means the producer's epoch was fenced by the broker.
+// This is ALWAYS a data-integrity event. It must:
+//   a) Alert (ERROR, not WARN)
+//   b) Propagate up — do not produce more records until root cause is fixed
+//   c) The payment must be re-enqueued or the upstream DB transaction rolled back
+
+catch (ProducerFencedException e) {
+    log.error("CRITICAL: Producer fenced. Transaction aborted. " +
+              "Payment {} NOT delivered to Kafka.", paymentId, e);
+    metrics.increment("kafka.transaction.fence.count");
+    throw new PaymentDeliveryException("Kafka transaction aborted", e);
+    // ↑ Propagates to the payment service's retry mechanism
+}
+      </pre></div>
+    </div></div>
+
+    <div class="step"><div class="step-num">3</div><div class="step-body">
+      <strong>Add a transaction duration metric and alert</strong>
+      <div class="diagram"><pre>
+// Instrument transaction duration:
+long txStart = System.currentTimeMillis();
+producer.beginTransaction();
+// ... produce ...
+producer.commitTransaction();
+long txDuration = System.currentTimeMillis() - txStart;
+metrics.histogram("kafka.transaction.duration.ms", txDuration);
+
+// Alert if P95 transaction duration > 80% of transaction.timeout.ms:
+// 80% of 60s = 48s → fire a warning
+// This would have caught the problem long before the audit found it.
+
+// Also: set a shorter transaction.timeout.ms to fail fast:
+transaction.timeout.ms=10000  // 10s — transactions should be milliseconds
+// If KYC ever exceeds 10s: immediate exception, clear root cause
+      </pre></div>
+    </div></div>
+  </div>
+
+  <h3 style="color:var(--accent);margin:24px 0 12px">Why This Was Hard to Diagnose</h3>
+  <table class="kv-table">
+    <thead><tr><th>Why it fooled people</th><th>What it actually meant</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>EOS was "fully configured" — idempotent + transactional + read_committed</td>
+        <td>EOS prevents duplicate delivery and ensures atomic writes. It does NOT prevent application-level bugs where a transaction is correctly aborted but the application fails to retry the operation.</td>
+      </tr>
+      <tr>
+        <td>Producer showed success (send() callback had no error)</td>
+        <td>send() succeeds — the record enters the transaction in an open state. The transaction timeout fires LATER. The send callback fires before the transaction commit, so it always shows success for the record itself.</td>
+      </tr>
+      <tr>
+        <td>Consumer lag = 0</td>
+        <td>The consumer correctly skipped aborted transaction records (isolation.level=read_committed). It consumed the offsets (moving past the abort markers) but logically never "saw" the data. Lag = 0 but records missed.</td>
+      </tr>
+      <tr>
+        <td>Occurrence rate: 1 in 5,000</td>
+        <td>Low enough to hide in log noise. High enough to be a regulatory issue over 6 months (thousands of missing payments).</td>
+      </tr>
+      <tr>
+        <td>Log said "reinitialising producer" (WARN)</td>
+        <td>Sounded routine. Was actually a silent data loss event every time it occurred.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3 style="color:var(--accent);margin:24px 0 12px">How to Tell This Story in an Interview</h3>
+  <div class="callout tip">
+    <span class="callout-icon">🎯</span>
+    <div class="callout-body">
+      <strong>S</strong> — "We had a payments pipeline with full EOS configured. A regulatory audit found 0.02% of payments missing over 6 months. No errors, no DLQ, lag always zero."<br><br>
+      <strong>T</strong> — "Three teams had looked at it over 3 weeks. My task was to find the root cause before the next regulatory checkpoint."<br><br>
+      <strong>A</strong> — "The key diagnostic insight was comparing read_uncommitted vs read_committed on the topic. The missing records existed as <em>aborted transactions</em> — they were in Kafka but invisible to the consumer. This told me the problem was on the producer side: transactions were being started but then aborted by the broker. The producer logs had WARN-level messages buried in millions of lines. I correlated the timestamps of those WARNs with the missing payment IDs and they matched exactly. The root cause was an external API call inside the transaction window exceeding the 60-second transaction.timeout.ms, causing broker-side abort. The exception was silently swallowed in a catch block."<br><br>
+      <strong>R</strong> — "We moved the API call outside the transaction, added strict exception handling and alerting, and reduced transaction.timeout.ms to 10 seconds to fail fast. We backfilled the ~3,400 missing payments from the source system. Zero occurrences since the fix. We also added a transaction duration histogram to proactively alert on any future transaction timeout risk."<br><br>
+      <em>Optional kicker:</em> "The broader lesson: EOS guarantees atomic delivery — either the commit succeeds or the abort is clean. But it cannot guarantee that your application retries after an abort. That's application responsibility. EOS doesn't make silent exception swallowing safe."
+    </div>
+  </div>
+</div>
+
+</div></div>
+</body></html>

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka Security — Interview Prep</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <a href="index.html">← Index</a><span class="header-sep">/</span>
+  <h1>🔐 Kafka Security</h1>
+  <div class="header-right"><span class="pill pill-red">Security</span><span class="pill pill-green">Complete</span></div>
+</header>
+<div class="layout">
+<nav class="toc"><div class="toc-inner">
+  <h3>On This Page</h3>
+  <a href="#overview">Security Layers</a>
+  <a href="#tls">TLS / SSL</a>
+  <a href="#sasl">SASL Authentication</a>
+  <a href="#acls">ACLs &amp; Authorization</a>
+  <a href="#inter-broker">Inter-Broker Security</a>
+  <a href="#encryption-rest">Encryption at Rest</a>
+  <a href="#audit">Audit Logging</a>
+  <a href="#qa">Q&amp;A</a>
+</div></nav>
+<div class="content">
+
+<!-- Overview -->
+<div class="section" id="overview">
+  <div class="section-header"><span class="section-icon">🛡️</span><span class="section-title">Kafka Security Layers</span></div>
+
+  <div class="diagram">  KAFKA SECURITY MODEL (3 independent layers):
+  ──────────────────────────────────────────────────────────────────
+
+  Layer 1: ENCRYPTION IN TRANSIT (TLS/SSL)
+    Client → Broker: TLS 1.2/1.3 (encrypt all data on the wire)
+    Broker → Broker: TLS (inter-broker)
+    Client → ZooKeeper: TLS (if ZK mode)
+
+  Layer 2: AUTHENTICATION (Who is this client?)
+    Options: SASL/PLAIN, SASL/SCRAM, SASL/GSSAPI (Kerberos), SASL/OAUTHBEARER, mTLS
+
+  Layer 3: AUTHORIZATION (What can this client do?)
+    ACLs: per resource (Topic, Group, TransactionalId, Cluster)
+          per operation (Read, Write, Create, Delete, Alter, Describe...)
+          per principal (user, group)
+    Authorizer class: SimpleAclAuthorizer (built-in) or custom RBAC
+
+  INDEPENDENT CONFIGURATION:
+  listeners=PLAINTEXT://:9092,SSL://:9093,SASL_SSL://:9094
+  Each listener can have different security protocol.
+  Inter-broker can differ from client-facing listener.</div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Security Protocol Options</h4>
+      <p><code>PLAINTEXT</code> — No encryption, no auth (dev only)<br><code>SSL</code> — TLS encryption, optional client cert auth<br><code>SASL_PLAINTEXT</code> — SASL auth, no encryption (internal network only)<br><code>SASL_SSL</code> — SASL auth + TLS encryption (production standard)</p>
+    </div>
+    <div class="concept-card">
+      <h4>Principal</h4>
+      <p>The authenticated identity of a client. With SASL: <code>User:alice</code>. With mTLS: <code>User:CN=alice,OU=payments</code>. ACLs bind permissions to principals. A principal can have multiple ACLs across multiple resources.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Super Users</h4>
+      <p>Principals listed in <code>super.users=User:admin;User:kafka-broker</code> bypass all ACL checks. Use sparingly — only for admin service accounts and inter-broker communication in environments where you don't want per-topic ACLs for brokers.</p>
+    </div>
+    <div class="concept-card">
+      <h4>HSBC Context</h4>
+      <p>In a regulated financial institution: all traffic must be encrypted (SASL_SSL everywhere). All clients must be authenticated. All topic access must be ACL-controlled per team. Audit logging of all access events to SIEM.</p>
+    </div>
+  </div>
+</div>
+
+<!-- TLS -->
+<div class="section" id="tls">
+  <div class="section-header"><span class="section-icon">🔒</span><span class="section-title">TLS / SSL Configuration</span></div>
+
+  <div class="diagram">  BROKER SSL CONFIG (server.properties):
+  ──────────────────────────────────────────────────────────────────
+  listeners=SASL_SSL://:9093
+  advertised.listeners=SASL_SSL://broker1.hsbc.internal:9093
+
+  ssl.keystore.location=/etc/kafka/certs/kafka-broker.keystore.jks
+  ssl.keystore.password=changeit
+  ssl.key.password=changeit
+  ssl.truststore.location=/etc/kafka/certs/kafka.truststore.jks
+  ssl.truststore.password=changeit
+
+  # Require client certificate (mTLS) — optional
+  ssl.client.auth=required      # required | requested | none
+
+  ssl.protocol=TLSv1.3          # Enforce TLS 1.3 (disable 1.2 in regulated env)
+  ssl.enabled.protocols=TLSv1.3,TLSv1.2
+  ssl.cipher.suites=TLS_AES_256_GCM_SHA384,TLS_AES_128_GCM_SHA256
+
+  # Certificate verification
+  ssl.endpoint.identification.algorithm=https   # Verify broker hostname in cert
+
+  PRODUCER/CONSUMER SSL CONFIG:
+  ──────────────────────────────────────────────────────────────────
+  security.protocol=SASL_SSL
+  ssl.truststore.location=/etc/kafka/client.truststore.jks
+  ssl.truststore.password=changeit
+  # If mTLS (client cert required):
+  ssl.keystore.location=/etc/kafka/client.keystore.jks
+  ssl.keystore.password=changeit</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Performance impact of TLS:</strong> TLS encryption adds CPU overhead and disables zero-copy (<code>sendfile()</code>). Expect ~20–30% throughput reduction vs plaintext. Mitigation: use AES-NI hardware acceleration (most modern CPUs support this — verify with <code>openssl speed aes-256-gcm</code>). Use TLS session resumption to amortize handshake cost for long-lived connections.</div>
+  </div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Certificate management:</strong> Use short-lived certificates (90 days) from an internal PKI / Vault PKI engine. Automate rotation — manual certificate management at scale leads to outages when certs expire. Set up monitoring on cert expiry dates (alert at 30 days, critical at 7 days).</div>
+  </div>
+</div>
+
+<!-- SASL -->
+<div class="section" id="sasl">
+  <div class="section-header"><span class="section-icon">🔑</span><span class="section-title">SASL Authentication Mechanisms</span></div>
+
+  <table class="kv-table">
+    <tr><th>Mechanism</th><th>How it Works</th><th>Use Case</th><th>Operational Notes</th></tr>
+    <tr><td>SASL/PLAIN</td><td>Username + password in plaintext SASL exchange (must use with TLS)</td><td>Simple setups, dev/test</td><td>Credentials in broker config. Restart required to add users. Not scalable.</td></tr>
+    <tr><td>SASL/SCRAM-SHA-256<br>SASL/SCRAM-SHA-512</td><td>Challenge-response with salted hashing. Credential stored in ZK/KRaft metadata — no plaintext password.</td><td>Production without Kerberos</td><td>Users managed via <code>kafka-configs.sh</code>. Hot-reload (no restart). Prefer SHA-512.</td></tr>
+    <tr><td>SASL/GSSAPI (Kerberos)</td><td>Kerberos ticket exchange. Client uses keytab/credential cache.</td><td>Enterprise with Active Directory/Kerberos</td><td>Complex setup. Requires KDC infrastructure. Token-based — no password on wire. Standard in banking.</td></tr>
+    <tr><td>SASL/OAUTHBEARER</td><td>OAuth 2.0 JWT tokens. Client obtains token from IdP, presents to Kafka.</td><td>Cloud-native, service mesh</td><td>Requires custom LoginModule or Confluent extensions for production-grade validation.</td></tr>
+    <tr><td>mTLS (SSL client auth)</td><td>Client presents certificate. Principal extracted from cert CN/SAN.</td><td>Zero-trust networks, service-to-service</td><td>No separate SASL config needed. Principal = cert subject. Cert rotation is the auth renewal mechanism.</td></tr>
+  </table>
+
+  <div class="diagram">  SCRAM USER MANAGEMENT:
+  ──────────────────────────────────────────────────────────────────
+  # Create SCRAM user (stored in ZK / KRaft metadata, no restart needed)
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type users --entity-name alice \
+    --alter --add-config 'SCRAM-SHA-512=[password=s3cr3t]'
+
+  # Delete user
+  kafka-configs.sh --bootstrap-server broker:9092 \
+    --entity-type users --entity-name alice \
+    --alter --delete-config 'SCRAM-SHA-512'
+
+  # Client config (SCRAM):
+  security.protocol=SASL_SSL
+  sasl.mechanism=SCRAM-SHA-512
+  sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
+    username="alice" password="s3cr3t";
+
+  BROKER CONFIG (enable SCRAM):
+  sasl.enabled.mechanisms=SCRAM-SHA-512
+  sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512</div>
+</div>
+
+<!-- ACLs -->
+<div class="section" id="acls">
+  <div class="section-header"><span class="section-icon">📋</span><span class="section-title">ACLs &amp; Authorization</span></div>
+
+  <div class="diagram">  ACL STRUCTURE:
+  Principal + ResourceType + ResourceName + Operation + Allow/Deny
+  ──────────────────────────────────────────────────────────────────
+
+  Resource Types: Topic, Group, Cluster, TransactionalId, DelegationToken
+
+  Operations per resource:
+    Topic:        Read, Write, Create, Delete, Alter, Describe, AlterConfigs, DescribeConfigs
+    Group:        Read, Describe, Delete
+    Cluster:      Create, Alter, Describe, AlterConfigs, DescribeConfigs, IdempotentWrite
+
+  ACL EXAMPLES:
+  # Allow producer to write to a topic
+  kafka-acls.sh --bootstrap-server broker:9092 \
+    --add --allow-principal User:payments-producer \
+    --operation Write --topic payments
+
+  # Allow consumer to read from topic + commit offsets to group
+  kafka-acls.sh --bootstrap-server broker:9092 \
+    --add --allow-principal User:payments-consumer \
+    --operation Read --topic payments
+  kafka-acls.sh --bootstrap-server broker:9092 \
+    --add --allow-principal User:payments-consumer \
+    --operation Read --group payments-processor-group
+
+  # Allow wildcard (all topics with prefix "payments-")
+  kafka-acls.sh --bootstrap-server broker:9092 \
+    --add --allow-principal User:payments-team \
+    --operation Read,Write --topic 'payments-' --resource-pattern-type prefixed
+
+  # List ACLs
+  kafka-acls.sh --bootstrap-server broker:9092 --list --topic payments
+
+  # Deny specific operation (DENY takes precedence over ALLOW)
+  kafka-acls.sh --bootstrap-server broker:9092 \
+    --add --deny-principal User:analytics-reader \
+    --operation Delete --topic payments</div>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body"><strong>Common ACL mistakes:</strong><br>
+    1. Forgetting the <strong>consumer group ACL</strong> — consumers need Read on the topic AND Read on their consumer group. Without group ACL, they get "Authorization failed" on offset commits.<br>
+    2. <strong>Idempotent producers</strong> need <code>IDEMPOTENT_WRITE</code> on Cluster resource: <code>--operation IdempotentWrite --cluster</code>.<br>
+    3. <strong>Transactional producers</strong> need <code>Write</code> on <code>TransactionalId</code> resource.<br>
+    4. ACL changes take effect immediately — no broker restart needed.</div>
+  </div>
+
+  <table class="kv-table">
+    <tr><th>Scenario</th><th>Required ACLs</th></tr>
+    <tr><td>Standard producer</td><td>Write on Topic, Describe on Topic (for metadata)</td></tr>
+    <tr><td>Idempotent producer</td><td>+ IdempotentWrite on Cluster</td></tr>
+    <tr><td>Transactional producer</td><td>+ Write on TransactionalId, Write on all topics in transaction</td></tr>
+    <tr><td>Standard consumer</td><td>Read on Topic, Read on Group, Describe on Topic</td></tr>
+    <tr><td>kafka-consumer-groups.sh (read-only)</td><td>Describe on Group, Describe on Topic</td></tr>
+    <tr><td>kafka-topics.sh --create</td><td>Create on Cluster or Create on Topic (if topic-level create allowed)</td></tr>
+    <tr><td>Kafka Connect worker</td><td>Read/Write on internal Connect topics, Read/Write on source/sink topics, Create on Cluster</td></tr>
+    <tr><td>MirrorMaker 2</td><td>Read on all source topics, Write on all target topics, Read on source groups, ClusterAction on both clusters</td></tr>
+  </table>
+</div>
+
+<!-- Inter-Broker Security -->
+<div class="section" id="inter-broker">
+  <div class="section-header"><span class="section-icon">🔄</span><span class="section-title">Inter-Broker Security</span></div>
+
+  <div class="diagram">  INTER-BROKER AUTH CONFIG:
+  ──────────────────────────────────────────────────────────────────
+  # Separate listener for inter-broker traffic (best practice)
+  listeners=SASL_SSL://0.0.0.0:9092,SASL_SSL://0.0.0.0:9093
+  listener.security.protocol.map=CLIENT:SASL_SSL,REPLICATION:SASL_SSL
+  inter.broker.listener.name=REPLICATION
+
+  # Inter-broker SASL mechanism
+  sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+
+  # Broker-to-broker credential (in JAAS config)
+  listener.name.replication.scram-sha-512.sasl.jaas.config=\
+    org.apache.kafka.common.security.scram.ScramLoginModule required \
+    username="kafka-broker" password="broker-secret";
+
+  # Grant broker principal super.users access (or specific ACLs)
+  super.users=User:kafka-broker
+
+  # KRaft: controller-broker communication also authenticated
+  # controller.listener.names=CONTROLLER
+  # listener.security.protocol.map=CONTROLLER:SASL_SSL</div>
+
+  <div class="callout info">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body"><strong>Why separate listener for replication?</strong> Different security policies can be applied to client vs replication traffic. Replication listener can be on a separate network interface (management network) isolated from client traffic. This reduces attack surface: compromise of client network doesn't expose replication traffic.</div>
+  </div>
+</div>
+
+<!-- Encryption at Rest -->
+<div class="section" id="encryption-rest">
+  <div class="section-header"><span class="section-icon">💾</span><span class="section-title">Encryption at Rest</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Kafka Native (None)</h4>
+      <p>Kafka does NOT encrypt data at rest natively. Log segments on disk are plaintext. Encryption at rest must be implemented at the OS/storage layer.</p>
+    </div>
+    <div class="concept-card">
+      <h4>OS/Volume Encryption</h4>
+      <p>Use Linux LUKS encryption (<code>dm-crypt</code>) or cloud provider disk encryption (AWS EBS encryption, Azure Disk Encryption). Transparent to Kafka — no code change. Key managed by KMS. Standard approach for compliance.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Cloud Provider Managed</h4>
+      <p>AWS MSK: EBS encryption with KMS CMK, automatically enabled. Confluent Cloud: AES-256 at rest, managed. Azure HDInsight: Azure Disk Encryption. Cloud-managed is simplest for new deployments.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Application-Level Encryption</h4>
+      <p>Producers encrypt sensitive fields before producing (field-level encryption). Authorized consumers decrypt. Schema Registry can store encryption metadata. Most complex but provides finest-grained control — specific fields encrypted, not entire messages.</p>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-icon">✅</span>
+    <div class="callout-body"><strong>HSBC compliance approach:</strong> Layer 1 (OS disk encryption) covers regulatory requirements for data at rest. Layer 2 (TLS in transit) covers data in motion. For PII and sensitive financial data: add field-level encryption at the application layer. This way, even if a broker's disk is physically stolen, data is unreadable at two levels of encryption.</div>
+  </div>
+</div>
+
+<!-- Audit Logging -->
+<div class="section" id="audit">
+  <div class="section-header"><span class="section-icon">📝</span><span class="section-title">Audit Logging</span></div>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h4>Authorizer Audit Log</h4>
+      <p>Kafka's <code>SimpleAclAuthorizer</code> logs all ALLOW/DENY decisions to the broker log. Format: <code>Principal=User:alice,Operation=WRITE,Topic=payments,Result=ALLOW</code>. Parse and ship to SIEM (Splunk, ELK). Noisy but complete.</p>
+    </div>
+    <div class="concept-card">
+      <h4>Confluent Audit Log</h4>
+      <p>Confluent Platform (commercial) provides structured audit events as Avro records in a Kafka topic. More efficient than log parsing. Includes authentication events, authorization, and admin operations. Schema-versioned via SR.</p>
+    </div>
+    <div class="concept-card">
+      <h4>What to Audit</h4>
+      <p>Authentication: every login attempt (success and failure). Authorization: every ACL decision. Admin: topic create/delete/alter, ACL changes, quota changes, config changes. Data access: produce/consume on sensitive topics (selective — don't log all reads).</p>
+    </div>
+    <div class="concept-card">
+      <h4>SIEM Integration</h4>
+      <p>Ship broker authorizer logs to SIEM via Kafka → Logstash/Filebeat → Elasticsearch or Splunk. Create alerts for: repeated auth failures (brute force), unexpected topic access, ACL changes outside change-management windows.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Q&A -->
+<div class="section" id="qa">
+  <div class="section-header"><span class="section-icon">🎯</span><span class="section-title">Security Q&amp;A</span></div>
+  <div class="qa-list">
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        A consumer is getting "Authorization failed" even though you've granted READ on the topic. What did you miss?
+        <span class="difficulty d-mid">Mid</span></div>
+      <div class="qa-a">
+        Almost always: <strong>missing consumer group ACL</strong>. Consumers need two ACLs:
+        <ol>
+          <li><code>READ</code> on the <strong>Topic</strong> resource (to fetch records)</li>
+          <li><code>READ</code> on the <strong>Group</strong> resource (to commit offsets to the group coordinator)</li>
+        </ol>
+        The error "Authorization failed" on group operations is easy to miss because the consumer may successfully read for a while (reads work) but then fails when it tries to commit offsets. Check the full exception — it usually specifies which resource type failed authorization.<br><br>
+        Fix: <code>kafka-acls.sh --add --allow-principal User:consumer-app --operation Read --group payments-processor-group</code>
+      </div>
+    </div>
+
+    <div class="qa-item">
+      <div class="qa-q"><span class="q-badge">Q</span>
+        How do you handle Kafka certificate rotation without downtime?
+        <span class="difficulty d-senior">Senior</span></div>
+      <div class="qa-a">
+        Certificate rotation without downtime requires that both old and new certificates are trusted during the transition:
+        <ol>
+          <li><strong>Add new CA cert to truststore (before rotating leaf certs):</strong> Update the broker truststores to include BOTH old CA cert and new CA cert. Brokers accept clients with certs from either CA. No restart if using <code>ssl.client.auth=requested</code> (soft check) — brokers pick up new truststore dynamically in some versions.</li>
+          <li><strong>Rotate leaf certificates on clients:</strong> Update client keystores with certs signed by the new CA, one at a time. Brokers trust both CAs → no interruption.</li>
+          <li><strong>Rotate leaf certificates on brokers:</strong> Rolling restart of brokers with new keystore. One at a time, wait for ISR recovery between each.</li>
+          <li><strong>Remove old CA from truststore:</strong> After all clients and brokers are using new certs: remove old CA cert from truststores. This is the final cleanup step.</li>
+        </ol>
+        <strong>Automate with Vault PKI or cert-manager:</strong> Use short-lived certs (90 days) from HashiCorp Vault PKI engine. Automated rotation triggered 30 days before expiry. The dual-trust window during rotation is handled by the automation framework.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div></div>
+</body></html>
