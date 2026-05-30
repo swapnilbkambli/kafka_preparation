@@ -627,6 +627,451 @@ var DB = {
   related:['log.retention.ms']
 }
 
+,
+
+/* BROKER - NETWORK */
+'advertised.listeners': {
+  scope:'broker', def:'(must match listeners)',
+  desc:'The listener addresses the broker advertises to clients (producers, consumers) and other brokers. Clients receive this address from bootstrap; all subsequent connections go here. Format: LISTENER_NAME://hostname:port. The hostname MUST be reachable from client networks — the most common Kafka connectivity misconfiguration is advertising an internal IP unreachable from external clients.',
+  values:[
+    {val:'PLAINTEXT://broker1.internal:9092', when:'Internal-only cluster. All clients on the same network as brokers.'},
+    {val:'PLAINTEXT://broker1.internal:9092,SSL://broker1.public:9093', when:'Dual listener: internal plaintext + external TLS. Clients choose the appropriate listener.'},
+    {val:'INTERNAL://...,EXTERNAL://...', when:'Separate listeners for inter-broker traffic vs. client traffic.'}
+  ],
+  warn:'The most common cause of "can connect at bootstrap but fail on all subsequent produce/consume requests" — the advertised hostname is wrong or unreachable from the client network.',
+  related:['listeners','bootstrap.servers','controller.listener.names']
+},
+'listeners': {
+  scope:'broker', def:'PLAINTEXT://:9092',
+  desc:'Comma-separated list of URIs the broker binds to and listens on. Format: LISTENER_NAME://host:port. Listener names must match advertised.listeners. You can define multiple listeners for different protocols (PLAINTEXT, SSL, SASL) or different traffic roles (inter-broker, client, controller).',
+  values:[
+    {val:'PLAINTEXT://:9092', when:'Default. Single plaintext listener on all interfaces.'},
+    {val:'PLAINTEXT://:9092,SSL://:9093', when:'Dual: plaintext for internal, TLS for external clients.'},
+    {val:'INTERNAL://:9092,EXTERNAL://:9093,CONTROLLER://:9094', when:'Production KRaft: separate listeners for inter-broker, client, and controller traffic.'}
+  ],
+  related:['advertised.listeners','controller.listener.names']
+},
+'socket.send.buffer.bytes': {
+  scope:'broker', def:'102400 (100 KB)',
+  desc:'TCP socket send buffer size (SO_SNDBUF) for all network connections. -1 means use OS default. The OS kernel uses this to buffer outgoing data before it is acknowledged by the remote end. Larger values help on high-latency networks or high-throughput clusters.',
+  values:[
+    {val:'102400 (100 KB)', when:'Default. Adequate for low-latency LAN.'},
+    {val:'-1', when:'Use OS default (auto-tuned via tcp_wmem). Often the best choice — kernel adjusts automatically.'},
+    {val:'1048576 (1 MB)', when:'Cross-datacenter links or high-latency WAN. Reduces stalls when ACKs are delayed.'}
+  ],
+  related:['socket.receive.buffer.bytes','num.network.threads']
+},
+'socket.receive.buffer.bytes': {
+  scope:'broker', def:'102400 (100 KB)',
+  desc:'TCP socket receive buffer size (SO_RCVBUF) for all network connections. -1 uses OS default. Larger values reduce stalling when producers burst data faster than the broker can process it.',
+  values:[
+    {val:'102400 (100 KB)', when:'Default.'},
+    {val:'-1', when:'Let the OS auto-tune via net.core.rmem_max. Recommended on tuned Linux hosts.'},
+    {val:'1048576 (1 MB)', when:'High-throughput brokers receiving >500 MB/s. Reduces TCP receive window stalls.'}
+  ],
+  related:['socket.send.buffer.bytes','num.network.threads']
+},
+
+/* BROKER - STORAGE */
+'log.dirs': {
+  scope:'broker', def:'/tmp/kafka-logs',
+  desc:'Comma-separated list of directories where Kafka stores partition log data. Multiple directories = JBOD (Just a Bunch Of Disks) — Kafka distributes partitions across all dirs by free space, multiplying disk throughput without RAID. Each directory should map to a separate physical disk or NVMe for maximum I/O parallelism.',
+  values:[
+    {val:'/tmp/kafka-logs', when:'Default — development only. Single directory, no redundancy.'},
+    {val:'/data1/kafka,/data2/kafka,/data3/kafka', when:'Production JBOD with 3 dedicated data disks.'},
+    {val:'/nvme0/kafka,/nvme1/kafka', when:'Dual NVMe JBOD. Maximise random IOPS on high-throughput clusters.'}
+  ],
+  warn:'NEVER place log.dirs on the OS root partition or any shared filesystem. Disk full on the root partition kills the OS. Disk full on Kafka data crashes the broker with DiskAccessException.',
+  related:['log.retention.ms','log.retention.bytes','num.recovery.threads.per.data.dir']
+},
+'log.flush.interval.messages': {
+  scope:'broker', def:'Long.MAX_VALUE (effectively disabled)',
+  desc:'Number of messages written before forcing an fsync to disk. Kafka deliberately disables this — durability comes from RF=3 + min.insync.replicas=2 (replication across multiple brokers), NOT from fsync. Forcing frequent fsyncs destroys throughput because fsync blocks the entire write path.',
+  values:[
+    {val:'Long.MAX_VALUE', when:'Default and ALWAYS recommended. Let OS page cache flush on its own schedule.'},
+    {val:'1', when:'NEVER. One fsync per message. Throughput collapses to ~1000 msg/s. Only if a regulator explicitly mandates it AND you have benchmarked the impact.'}
+  ],
+  warn:'Kafka durability is achieved through replication, not fsync. Setting this low is a common misunderstanding that destroys performance without meaningful additional safety.',
+  related:['log.flush.interval.ms','min.insync.replicas','replica.lag.time.max.ms']
+},
+'log.flush.interval.ms': {
+  scope:'broker', def:'Long.MAX_VALUE (effectively disabled)',
+  desc:'Maximum time between forced fsyncs. Like log.flush.interval.messages, disabled by default. Kafka trusts OS page cache and replication for durability.',
+  values:[
+    {val:'Long.MAX_VALUE', when:'Default and recommended. Rely on OS and replication.'},
+    {val:'1000–5000', when:'Only if explicit regulatory requirement for periodic fsync AND performance impact is accepted.'}
+  ],
+  related:['log.flush.interval.messages','min.insync.replicas']
+},
+'log.cleaner.threads': {
+  scope:'broker', def:'1',
+  desc:'Number of background threads dedicated to log compaction. These scan compact topics, identify duplicate keys, and remove older records per key. More threads = faster compaction, but higher disk and CPU overhead. Monitor log-cleaner-io-time-total metric.',
+  values:[
+    {val:'1', when:'Default. Sufficient for a few compacted topics.'},
+    {val:'2–4', when:'Clusters with many high-throughput compacted topics (CDC, config stores). Watch cleaner-io-time metric.'}
+  ],
+  related:['log.cleaner.min.cleanable.ratio','cleanup.policy','min.compaction.lag.ms']
+},
+'log.cleaner.min.cleanable.ratio': {
+  scope:'broker', def:'0.5',
+  desc:'Minimum ratio of dirty (uncompacted) bytes to total log bytes before the cleaner selects a partition for compaction. 0.5 = at least 50% of the log must be dirty before compaction fires. Lower = more aggressive compaction (more CPU). Higher = less frequent (more disk but less CPU).',
+  values:[
+    {val:'0.5', when:'Default. Balanced. Compaction fires when >50% of log is dirty.'},
+    {val:'0.1–0.3', when:'Aggressive compaction. Topics where consumers need very fresh state.'},
+    {val:'0.7–0.9', when:'Reduce cleaner overhead on large-volume compacted topics where some staleness is acceptable.'}
+  ],
+  related:['log.cleaner.threads','cleanup.policy','delete.retention.ms']
+},
+'log.roll.hours': {
+  scope:'broker', def:'168 (7 days)',
+  desc:'Maximum time before Kafka rolls a log segment to a new file, even if it has not reached log.segment.bytes. Ensures segments eventually roll on low-traffic partitions (which allows retention policies to delete them). Without this, a quiet partition could sit on a single segment forever.',
+  values:[
+    {val:'168 (7 days)', when:'Default. Low-traffic partitions roll at most weekly.'},
+    {val:'24', when:'Daily roll. Predictable segment boundaries; easier to reason about retention windows.'},
+    {val:'1', when:'Hourly roll. Very granular retention. Creates many small files — avoid unless necessary.'}
+  ],
+  related:['log.segment.bytes','log.retention.ms']
+},
+'num.recovery.threads.per.data.dir': {
+  scope:'broker', def:'1',
+  desc:'Threads used per log.dirs directory to load and recover log segments at broker startup after an unclean shutdown. Higher values parallelise partition recovery and dramatically reduce startup time on large brokers. After a clean shutdown, this setting has no effect — recovery is near-instant.',
+  values:[
+    {val:'1', when:'Default. Sequential recovery. A broker with 1000 partitions may take 10+ minutes to start after a crash.'},
+    {val:'4–8', when:'Production. Parallelises recovery across all partitions in a directory. Critical for large brokers.'}
+  ],
+  related:['log.dirs','controlled.shutdown.enable']
+},
+'replica.fetch.max.bytes': {
+  scope:'broker', def:'1048576 (1 MB)',
+  desc:'Maximum bytes a follower fetches per partition per replication fetch request. Must be at least as large as message.max.bytes — if a message is larger than this limit, the follower can never replicate it and will fall out of ISR permanently.',
+  values:[
+    {val:'1048576 (1 MB)', when:'Default. Matches default message.max.bytes.'},
+    {val:'5242880 (5 MB)', when:'When message.max.bytes is increased. Always keep these in sync.'}
+  ],
+  warn:'replica.fetch.max.bytes must be >= message.max.bytes. A mismatch causes followers to permanently fail to replicate large messages, causing irreversible ISR shrinkage.',
+  related:['message.max.bytes','num.replica.fetchers','replica.lag.time.max.ms']
+},
+'log.local.retention.ms': {
+  scope:'broker / topic', def:'-2 (inherits log.retention.ms)',
+  desc:'For topics with tiered storage enabled: how long data is retained in local broker disk before being eligible for deletion (after upload to remote storage like S3 or GCS). -2 inherits log.retention.ms (no local reduction). Set shorter than log.retention.ms to keep only recent hot data locally while cold data remains accessible via remote storage.',
+  values:[
+    {val:'-2', when:'Default. Local retention same as total retention. Tiered storage does not reduce local disk.'},
+    {val:'86400000 (1 day)', when:'Keep only 24 h locally. Older data on remote storage. Drastically reduces local disk for long-retention topics.'}
+  ],
+  related:['log.retention.ms','log.retention.bytes']
+},
+
+/* BROKER - ADMIN */
+'offsets.retention.minutes': {
+  scope:'broker', def:'10080 (7 days)',
+  desc:'How long committed consumer group offsets are retained after a group goes inactive (no active consumers). After this window, the group\'s offsets are deleted. If a consumer is offline longer than this, it loses its saved position and falls back to auto.offset.reset on next start.',
+  values:[
+    {val:'10080 (7 days)', when:'Default. Groups idle >7 days lose their offsets.'},
+    {val:'20160 (14 days)', when:'When consumers may be offline for extended periods (e.g., weekly batch jobs).'},
+    {val:'1440 (1 day)', when:'Active streaming clusters. Short-lived consumer groups. Saves __consumer_offsets space.'}
+  ],
+  related:['auto.offset.reset','enable.auto.commit','offsets.topic.replication.factor']
+},
+'controlled.shutdown.max.retries': {
+  scope:'broker', def:'3',
+  desc:'Number of times the broker retries a graceful shutdown if the first attempt fails (e.g., followers not yet caught up for leader migration). After exhausting retries, the broker shuts down forcibly.',
+  values:[
+    {val:'3', when:'Default.'},
+    {val:'5–10', when:'Large clusters where leader migration may need more time. Increases the clean-shutdown window.'}
+  ],
+  related:['controlled.shutdown.enable','controlled.shutdown.retry.backoff.ms']
+},
+'controlled.shutdown.retry.backoff.ms': {
+  scope:'broker', def:'5000 (5 s)',
+  desc:'Wait time between controlled shutdown retry attempts. Gives followers time to catch up after a failed migration before retrying.',
+  values:[
+    {val:'5000', when:'Default.'},
+    {val:'10000', when:'High-latency clusters or when follower catch-up is known to be slow.'}
+  ],
+  related:['controlled.shutdown.enable','controlled.shutdown.max.retries']
+},
+'queued.max.request.bytes': {
+  scope:'broker', def:'-1 (unlimited)',
+  desc:'Maximum total byte size of all requests waiting in the RequestQueue. A byte-size companion to queued.max.requests (which limits by count). -1 = no byte cap. Useful to prevent memory exhaustion from a small number of very large produce requests filling the queue.',
+  values:[
+    {val:'-1', when:'Default. No byte-size cap. Rely on queued.max.requests count limit.'},
+    {val:'1073741824 (1 GB)', when:'Cap total queue memory to prevent OOM when large produce batches back up.'}
+  ],
+  related:['queued.max.requests','num.io.threads']
+},
+'group.max.session.timeout.ms': {
+  scope:'broker', def:'1800000 (30 min)',
+  desc:'Broker-side upper bound on what session.timeout.ms value a consumer may request. If a consumer tries to join with session.timeout.ms exceeding this value, the broker rejects the JoinGroup. Acts as a cluster-wide cap preventing consumers from setting excessively long session timeouts that mask dead consumers.',
+  values:[
+    {val:'1800000 (30 min)', when:'Default. Consumers can request up to 30-minute sessions.'},
+    {val:'300000 (5 min)', when:'Stricter: ensures dead consumers are detected within 5 minutes maximum.'}
+  ],
+  related:['session.timeout.ms','heartbeat.interval.ms']
+},
+
+/* PRODUCER / CONSUMER */
+'request.timeout.ms': {
+  scope:'producer / consumer', def:'30000 (30 s)',
+  desc:'Maximum time the client waits for a response from the broker after sending a request. If no response arrives, the request fails and is retried (if retries > 0). Distinct from delivery.timeout.ms (total send lifecycle) and max.poll.interval.ms (consumer poll loop timing).',
+  values:[
+    {val:'30000 (30 s)', when:'Default. Appropriate for most stable clusters.'},
+    {val:'10000 (10 s)', when:'Fast failure detection in well-connected clusters.'},
+    {val:'60000 (60 s)', when:'Slow brokers, heavy load, or cross-region deployments with higher RTT.'}
+  ],
+  warn:'delivery.timeout.ms must be > request.timeout.ms + linger.ms, otherwise records can time out before the first delivery attempt even completes.',
+  related:['delivery.timeout.ms','retries','max.block.ms']
+},
+'fetch.max.bytes': {
+  scope:'consumer', def:'52428800 (50 MB)',
+  desc:'Maximum total bytes the broker returns in a single FetchResponse across ALL partitions assigned to this consumer. A global cap on the response size. If a single partition\'s data exceeds max.partition.fetch.bytes it is still returned (to avoid starvation), but this caps the aggregate across all partitions in the response.',
+  values:[
+    {val:'52428800 (50 MB)', when:'Default.'},
+    {val:'104857600 (100 MB)', when:'High-throughput consumers subscribed to many partitions. Reduces fetch round-trips.'},
+    {val:'5242880 (5 MB)', when:'Memory-constrained consumers or containers with tight heap limits.'}
+  ],
+  related:['max.partition.fetch.bytes','fetch.min.bytes','fetch.max.wait.ms']
+},
+'bootstrap.servers': {
+  scope:'producer / consumer / admin', def:'(must be set)',
+  desc:'Comma-separated host:port pairs for the initial broker connection. Used ONLY for bootstrapping — the client connects here first to fetch full cluster metadata, then connects directly to partition leaders. You do NOT need to list every broker; 2–3 ensures resiliency if one is down at startup.',
+  values:[
+    {val:'broker1:9092', when:'Single entry. No resiliency — if that broker is down, client cannot start.'},
+    {val:'broker1:9092,broker2:9092,broker3:9092', when:'Production: 3 brokers. Client bootstraps successfully even if 1–2 are down.'}
+  ],
+  related:['advertised.listeners']
+},
+'producer_byte_rate': {
+  scope:'broker (quota)', def:'Long.MAX_VALUE (unlimited)',
+  desc:'Per-client-ID byte rate quota for producers. Set via kafka-configs.sh --entity-type clients. When a producer exceeds this rate, the broker throttles it by delaying responses (produce-throttle-time-avg increases). Protects the cluster from a single runaway producer monopolising bandwidth.',
+  values:[
+    {val:'Long.MAX_VALUE', when:'Default: no quota.'},
+    {val:'10485760 (10 MB/s)', when:'Standard quota for a well-behaved production producer.'},
+    {val:'1048576 (1 MB/s)', when:'Restrict a bulk-ingest job to prevent starving other producers.'}
+  ],
+  related:['request.timeout.ms','buffer.memory']
+},
+
+/* CONNECT / MM2 */
+'exactly.once.source.support': {
+  scope:'connect', def:'disabled',
+  desc:'Enables exactly-once semantics for Kafka Connect source connectors. When enabled, source connectors use Kafka transactions to atomically write records and commit source offsets. Requires connector to implement ExactlyOnceSourceTask interface and ACL grants for IDEMPOTENT_WRITE + transaction permissions.',
+  values:[
+    {val:'disabled', when:'Default. At-least-once for source connectors.'},
+    {val:'enabled', when:'Enable for EOS-capable source connectors. Connector must support it explicitly.'},
+    {val:'preparing', when:'Transitional state during upgrade to EOS. Grants necessary ACLs without enforcing EOS yet.'}
+  ],
+  related:['transactional.id','enable.idempotence','offset.flush.interval.ms']
+},
+'replication.policy.class': {
+  scope:'connect (MM2)', def:'DefaultReplicationPolicy',
+  desc:'MirrorMaker 2 policy controlling how topic names map between source and target clusters. DefaultReplicationPolicy prefixes topics with the source cluster alias (e.g., "dc-a.payments"). IdentityReplicationPolicy preserves original names — required when DR consumers should use the same topic names without config changes.',
+  values:[
+    {val:'DefaultReplicationPolicy', when:'Multi-cluster fan-in / fan-out. Topic names become "source-alias.topic-name". Makes data origin explicit.'},
+    {val:'IdentityReplicationPolicy', when:'Active-passive DR. Consumers on DR cluster use identical topic names as primary. No consumer config changes on failover.'}
+  ],
+  related:['sync.group.offsets.enabled']
+},
+'sync.group.offsets.enabled': {
+  scope:'connect (MM2)', def:'false',
+  desc:'Whether MirrorMaker 2 periodically translates and syncs consumer group committed offsets from the source cluster to the target cluster. When true, consumer groups can resume from approximately the correct position after a DR failover instead of starting from auto.offset.reset.',
+  values:[
+    {val:'false', when:'Default. No offset sync. DR failover means consumers restart from auto.offset.reset.'},
+    {val:'true', when:'DR scenarios. Consumers on the target cluster resume near the correct offset after failover. Pair with sync.group.offsets.interval.seconds.'}
+  ],
+  related:['sync.group.offsets.interval.seconds','replication.policy.class','auto.offset.reset']
+},
+'sync.group.offsets.interval.seconds': {
+  scope:'connect (MM2)', def:'60',
+  desc:'How often MM2 syncs translated consumer group offsets from source to target cluster. More frequent sync = smaller offset gap on failover (less reprocessing), but more write overhead on the target __consumer_offsets topic.',
+  values:[
+    {val:'60', when:'Default. Up to 60 s of messages may need reprocessing on failover.'},
+    {val:'10–30', when:'Low-latency DR. Minimize reprocessing window on failover.'},
+    {val:'300', when:'Batch consumers where a few minutes of replay is acceptable.'}
+  ],
+  related:['sync.group.offsets.enabled','replication.policy.class']
+},
+
+/* KRAFT / MIGRATION */
+'zookeeper.metadata.migration.enable': {
+  scope:'broker', def:'false',
+  desc:'Enables the ZooKeeper-to-KRaft metadata migration mode. When set to true on a ZK-mode cluster with a new KRaft controller quorum configured, Kafka enters hybrid mode and begins migrating all metadata from ZooKeeper to the __cluster_metadata Raft log. This is Step 1 of the official ZK→KRaft migration path.',
+  values:[
+    {val:'false', when:'Default. Cluster operates in pure ZK mode (or pure KRaft if process.roles is set).'},
+    {val:'true', when:'During ZK→KRaft migration only. Remove after migration is fully complete.'}
+  ],
+  warn:'Migration is one-way. Once started and completed, do not revert to false. A partial migration leaves the cluster in an inconsistent state. Follow the official step-by-step migration runbook.',
+  related:['process.roles','controller.quorum.voters','zookeeper.session.timeout.ms']
+},
+
+/* KSQLDB */
+'ksql.service.id': {
+  scope:'ksqlDB', def:'default_',
+  desc:'Unique identifier for a ksqlDB cluster. Used as a prefix for all ksqlDB-internal Kafka topics (command topic, query topics, etc.). Two ksqlDB clusters sharing the same service.id will corrupt each other\'s command topic. Must be stable — changing it orphans all existing internal topics.',
+  values:[
+    {val:'default_', when:'Default. Fine only if there is a single ksqlDB cluster per Kafka cluster.'},
+    {val:'payments-ksql_', when:'Production: descriptive per-environment ID with trailing underscore for topic prefix clarity.'}
+  ],
+  warn:'Never share ksql.service.id between two ksqlDB clusters on the same Kafka cluster. They will write to the same command topic and corrupt each other\'s query state.',
+  related:['ksql.streams.num.standby.replicas','ksql.advertised.listener']
+},
+'ksql.streams.num.standby.replicas': {
+  scope:'ksqlDB', def:'0',
+  desc:'Number of standby replicas for ksqlDB state stores (backed by Kafka Streams / RocksDB). Standbys keep warm copies of state on other ksqlDB nodes. When a node fails, a standby replica allows near-instant failover without rebuilding state from the beginning of Kafka topics.',
+  values:[
+    {val:'0', when:'Default. Single copy of state. Node failure = full state rebuild from Kafka (can take minutes for large stores).'},
+    {val:'1', when:'Production HA. One standby per state store. Failover in seconds. 2× state storage requirement.'},
+    {val:'2', when:'Mission-critical pipelines. Tolerates 2 simultaneous node failures. 3× storage.'}
+  ],
+  related:['ksql.service.id','ksql.advertised.listener']
+},
+'ksql.advertised.listener': {
+  scope:'ksqlDB', def:'http://localhost:8088',
+  desc:'The URL this ksqlDB node advertises to other ksqlDB nodes for inter-node communication (pull query routing, state store lookups, standby replication). Must be set to this node\'s externally reachable URL. Without correct configuration, pull queries routed to the wrong node fail.',
+  values:[
+    {val:'http://localhost:8088', when:'Default — broken in a real multi-node cluster. Single-node development only.'},
+    {val:'http://ksql-node1.internal:8088', when:'Production: set to this node\'s reachable hostname/IP.'}
+  ],
+  related:['ksql.service.id','ksql.streams.num.standby.replicas']
+},
+
+/* SECURITY */
+'ssl.client.auth': {
+  scope:'broker', def:'none',
+  desc:'Controls whether the broker requires clients to present a TLS client certificate (mutual TLS / mTLS). "none" = server-only TLS (clients verify broker cert only). "required" = both sides present certificates — strong client authentication without SASL. "requested" = broker asks for cert but does not reject clients without one.',
+  values:[
+    {val:'none', when:'Default. One-way TLS. Use SASL for client identity. Standard in most deployments.'},
+    {val:'required', when:'Mutual TLS (mTLS). Both client and broker present certificates. Common in financial/regulated environments. No SASL needed.'},
+    {val:'requested', when:'Transitional during cert rollout. Broker asks for cert but does not block clients without one.'}
+  ],
+  related:['super.users','bootstrap.servers']
+},
+'super.users': {
+  scope:'broker', def:'(not set)',
+  desc:'Semicolon-separated list of principals that bypass ALL ACL checks. Format: User:name or User:CN=...,OU=... for mTLS principals. Super users can read/write any topic, manage ACLs, and alter configs without any explicit ACL grant.',
+  values:[
+    {val:'(not set)', when:'No super users. All access controlled exclusively via ACLs.'},
+    {val:'User:admin;User:kafka-broker', when:'Admin principal + broker inter-node communication principal. Minimum viable production super.users list.'}
+  ],
+  warn:'Super user access bypasses ALL authorisation. Restrict to the absolute minimum set of service accounts. Audit access logs regularly for super user activity.',
+  related:['ssl.client.auth']
+},
+'consumer.instance.timeout.ms': {
+  scope:'REST Proxy', def:'300000 (5 min)',
+  desc:'Kafka REST Proxy: how long a consumer instance is kept alive without a /records poll. After this timeout the proxy destroys the instance and commits offsets. Clients must poll before expiry or recreate the consumer. This is REST Proxy-specific — unrelated to Kafka\'s own session.timeout.ms.',
+  values:[
+    {val:'300000 (5 min)', when:'Default. REST consumers must poll at least every 5 minutes.'},
+    {val:'60000', when:'Strict cleanup of idle consumers. Reclaims proxy resources faster.'},
+    {val:'600000', when:'Slow consumers or infrequent polling patterns. Prevents unexpected consumer expiry.'}
+  ],
+  related:['session.timeout.ms','max.poll.interval.ms']
+},
+
+/* JMX METRICS */
+'RequestChannel.Request': {
+  scope:'broker (metric)', def:'N/A — internal object type',
+  desc:'The internal Kafka object representing a decoded client request waiting in the RequestQueue. Network threads parse raw TCP bytes into RequestChannel.Request objects and enqueue them. IO threads dequeue these, perform the actual work (disk write, log read, replication state update), and place responses on the response queue. The key observable: RequestQueueSize tells you how many are waiting. LocalTimeMs = IO thread processing time on disk. RemoteTimeMs = time in purgatory waiting for ISR acks.',
+  values:[
+    {val:'RequestQueueSize', when:'JMX: kafka.network:type=RequestChannel,name=RequestQueueSize. Alert if consistently approaching queued.max.requests.'},
+    {val:'LocalTimeMs high (>20 ms)', when:'Disk bottleneck. IO thread spending too long on disk write/read.'},
+    {val:'RemoteTimeMs high (>100 ms)', when:'Follower lag. Request parked in purgatory waiting for ISR acks. Fix the slow follower, not the IO threads.'}
+  ],
+  related:['num.io.threads','num.network.threads','queued.max.requests','RequestHandlerAvgIdlePercent']
+},
+'RequestHandlerAvgIdlePercent': {
+  scope:'broker (metric)', def:'target > 0.3 (30%)',
+  desc:'JMX metric: kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent. Fraction of time IO handler threads are idle. Below 30% means IO threads are saturated — requests are queuing faster than threads can process them. This is the primary broker CPU health signal. Causes: high throughput, compression mismatch (broker recompressing), or too few io threads.',
+  values:[
+    {val:'> 0.3', when:'Healthy. IO threads have spare capacity.'},
+    {val:'0.1 – 0.3', when:'Warning. Increase num.io.threads or investigate what is consuming CPU (async-profiler).'},
+    {val:'< 0.1', when:'Critical. Requests backing up. Clients will see TimeoutException. Immediate action required.'}
+  ],
+  warn:'If this drops without a matching increase in bytes in/out, the issue is CPU-intensive requests (broker recompression from codec mismatch, large message parsing). Profile with async-profiler before just raising num.io.threads.',
+  related:['num.io.threads','RequestChannel.Request','NetworkProcessorAvgIdlePercent','compression.type']
+},
+'NetworkProcessorAvgIdlePercent': {
+  scope:'broker (metric)', def:'target > 0.3 (30%)',
+  desc:'JMX metric: kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent. Fraction of time network processor (NIO Selector) threads are idle. Below 30% means network threads cannot read from sockets fast enough. Distinct from RequestHandlerAvgIdlePercent (IO thread saturation). Fix: increase num.network.threads.',
+  values:[
+    {val:'> 0.3', when:'Healthy. Network threads keeping up with socket I/O.'},
+    {val:'< 0.3', when:'Saturated. Increase num.network.threads. Also check for very high client connection counts.'}
+  ],
+  related:['num.network.threads','RequestHandlerAvgIdlePercent','RequestChannel.Request']
+},
+'ActiveControllerCount': {
+  scope:'broker (metric)', def:'exactly 1 across cluster',
+  desc:'JMX metric: kafka.controller:type=KafkaController,name=ActiveControllerCount. Per-broker metric — each broker reports 0 or 1; only the active controller reports 1. The SUM across all brokers MUST always equal exactly 1. Zero = no controller (leader election in progress or all controllers down). Two+ = split-brain (data corruption risk).',
+  values:[
+    {val:'sum = 1', when:'Normal cluster operation.'},
+    {val:'sum = 0', when:'Controller election in progress (< 30 s normal) OR all ZK/KRaft quorum nodes down. Alert if sustained > 30 s.'},
+    {val:'sum > 1', when:'CRITICAL split-brain. Immediate investigation. Alert expression: sum(kafka_controller_active) != 1'}
+  ],
+  warn:'Alert on sum != 1, not just sum = 0. Two active controllers can silently corrupt metadata.',
+  related:['process.roles','controller.quorum.voters','zookeeper.session.timeout.ms']
+},
+'UnderReplicatedPartitions': {
+  scope:'broker (metric)', def:'must be 0',
+  desc:'JMX metric: kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions. Number of partitions where ISR count < replication factor. Non-zero means at least one follower is behind or a broker is down. The most important Kafka health alert — any sustained non-zero value means the cluster is degraded and a subsequent broker failure could cause data loss.',
+  values:[
+    {val:'0', when:'Healthy. All partitions fully replicated.'},
+    {val:'> 0 for > 60 s', when:'Alert. Diagnose: broker down, follower falling behind (disk/network saturation), or ISR eviction loop.'},
+    {val:'Count = all partitions', when:'Critical. Likely a full broker failure or partition leadership instability.'}
+  ],
+  warn:'During a rolling restart, URP spikes briefly as each broker stops. Add a time buffer to your alert (e.g., > 0 for 1 min) to avoid false alarms during planned maintenance.',
+  related:['replica.lag.time.max.ms','min.insync.replicas','num.replica.fetchers','ReplicaFetcherManager.MaxLag']
+},
+'bufferpool-wait-ratio': {
+  scope:'producer (metric)', def:'target = 0',
+  desc:'JMX metric: kafka.producer:type=producer-metrics,name=bufferpool-wait-ratio. Fraction of time the producer Sender thread was blocked waiting for buffer.memory space to be freed. Any value > 0 means the producer is back-pressured — producing faster than the broker can accept. If this is > 0, send() calls are blocking on max.block.ms.',
+  values:[
+    {val:'0', when:'Healthy. Producer never waits for buffer space.'},
+    {val:'0.01 – 0.1', when:'Mild backpressure. Consider increasing buffer.memory or investigating broker throughput.'},
+    {val:'> 0.1', when:'Severe backpressure. Producer bottlenecked. Check broker health (URPs, disk, network). Increase buffer.memory or reduce production rate.'}
+  ],
+  related:['buffer.memory','max.block.ms','batch.size']
+},
+'records-lag-max': {
+  scope:'consumer (metric)', def:'target ≈ 0',
+  desc:'JMX metric: kafka.consumer:type=consumer-fetch-manager-metrics,name=records-lag-max. Maximum consumer lag (records behind latest offset) across ALL partitions assigned to this consumer instance. This is per-consumer-instance. For cluster-wide group lag monitoring, use Burrow, kminion, or kafka_consumer_group_lag Prometheus metric.',
+  values:[
+    {val:'≈ 0', when:'Consumer keeping up in real time.'},
+    {val:'> threshold (growing)', when:'Consumer falling behind. Scale out (add instances up to partition count), optimise processing, or investigate broker issues.'},
+    {val:'monotonically growing', when:'Consumer cannot keep up at all. Must scale horizontally or reduce max.poll.records to process smaller batches.'}
+  ],
+  related:['max.poll.records','max.poll.interval.ms','fetch.min.bytes','session.timeout.ms']
+},
+'ReplicaFetcherManager.MaxLag': {
+  scope:'broker (metric)', def:'target ≈ 0',
+  desc:'JMX metric: kafka.server:type=ReplicaFetcherManager,name=MaxLag. Maximum offset lag of follower replicas on THIS broker compared to their leaders. High MaxLag means this broker (as a follower) is not keeping up — risk of ISR eviction. Distinct from consumer lag (which is application-side). Common causes: disk I/O saturation, GC pause, network congestion between brokers.',
+  values:[
+    {val:'0 – few thousand', when:'Healthy. Follower roughly in sync.'},
+    {val:'Growing steadily', when:'Follower bottlenecked. Check disk IOPS, GC logs, num.replica.fetchers, network to leader brokers.'},
+    {val:'Stuck high > replica.lag.time.max.ms', when:'Follower will be evicted from ISR. If ISR shrinks below min.insync.replicas, writes will be rejected.'}
+  ],
+  related:['replica.lag.time.max.ms','num.replica.fetchers','UnderReplicatedPartitions']
+},
+
+/* EXCEPTIONS */
+'ProducerFencedException': {
+  scope:'producer', def:'N/A — exception class',
+  desc:'Runtime exception thrown when a transactional producer is fenced by a newer instance with the same transactional.id. Happens when: (1) the Transaction Coordinator auto-aborts a transaction because transaction.timeout.ms expired, issuing a new producer epoch; (2) a new producer instance starts with the same transactional.id, fencing the old one. The fenced producer throws this on its next produce() or commitTransaction() call.',
+  values:[
+    {val:'thrown on commitTransaction()', when:'Transaction was auto-aborted by broker (timeout expired) before the client noticed. Records are permanently gone — they were written as ABORTED transactions.'},
+    {val:'thrown on produce()', when:'Another producer instance with same transactional.id started and claimed the epoch.'}
+  ],
+  warn:'CRITICAL: Never catch and swallow ProducerFencedException. It means a transaction was silently aborted and records are lost. Log at ERROR, alert, and handle at application level — retrying will only start a fresh transaction, it cannot recover the lost records.',
+  related:['transactional.id','transaction.timeout.ms','isolation.level']
+},
+'NotEnoughReplicasException': {
+  scope:'producer', def:'N/A — exception class',
+  desc:'Exception thrown to producers when acks=all and the ISR count drops below min.insync.replicas. The broker deliberately refuses the write — this is intentional durability protection, not a bug. Common causes: broker down, follower falling behind due to disk/network saturation, or broker in the middle of a restart.',
+  values:[
+    {val:'thrown on send()', when:'ISR shrank below min.insync.replicas. Producer should retry with backoff — writes will succeed once ISR recovers.'},
+    {val:'sustained for minutes', when:'A broker is permanently down or a follower is irrecoverably lagging. Investigate UnderReplicatedPartitions and broker logs.'}
+  ],
+  warn:'With min.insync.replicas=2 and RF=3, losing 2 brokers simultaneously makes ALL critical topics unwritable. This is by design. Have a runbook for this failure mode.',
+  related:['min.insync.replicas','acks','unclean.leader.election.enable','UnderReplicatedPartitions']
+}
+
 }; // end DB
 
 // ── CSS ────────────────────────────────────────────────────────────────────
@@ -653,6 +1098,8 @@ styleEl.textContent = [
 '.kp-bg-broker{background:rgba(124,92,191,.18);color:#a47fe0}',
 '.kp-bg-topic{background:rgba(56,189,193,.18);color:#38bdc1}',
 '.kp-bg-connect{background:rgba(245,166,35,.18);color:#f5a623}',
+'.kp-bg-ksqlDB{background:rgba(255,82,164,.18);color:#ff52a4}',
+'.kp-bg-REST{background:rgba(255,140,50,.18);color:#ff8c32}',
 '.kp-bg-default{background:#22263a;color:#7b859c;border:1px solid #2e3350}',
 '#kp-desc{color:#c8d0e0;font-size:13.5px;line-height:1.7;margin-bottom:18px}',
 '.kp-sl{font-size:10px;font-weight:700;letter-spacing:1.2px;',
@@ -768,15 +1215,33 @@ document.getElementById('kp-x').addEventListener('click', hide);
 document.addEventListener('keydown', function(e){ if(e.key==='Escape') hide(); });
 
 // ── annotate <code> elements ───────────────────────────────────────────────
+// Sort keys longest-first so 'max.in.flight.requests.per.connection' matches
+// before 'max.in.flight.requests' when text has a '=' suffix etc.
+var _keys = Object.keys(DB).sort(function(a,b){ return b.length - a.length; });
+
+function _resolve(text){
+  // 1. exact match
+  if(DB[text]) return text;
+  // 2. prefix match: text starts with key followed by =, space, (, <, >, !
+  for(var i=0; i<_keys.length; i++){
+    var k = _keys[i];
+    if(text.length > k.length && text.indexOf(k) === 0){
+      var next = text.charAt(k.length);
+      if(/[=\s(<>!]/.test(next)) return k;
+    }
+  }
+  return null;
+}
+
 function annotate(){
   document.querySelectorAll('code').forEach(function(el){
     if(el.dataset.kpDone) return;
-    var name = el.textContent.trim();
-    if(!DB[name]) return;
+    var matched = _resolve(el.textContent.trim());
+    if(!matched) return;
     el.dataset.kpDone = '1';
     el.classList.add('kp-p');
-    el.title = name + ' — click for details';
-    el.addEventListener('click', function(e){ e.stopPropagation(); show(name); });
+    el.title = matched + ' — click for details';
+    (function(name){ el.addEventListener('click', function(e){ e.stopPropagation(); show(name); }); })(matched);
   });
 }
 
